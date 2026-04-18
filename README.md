@@ -13,10 +13,10 @@ The project focuses on:
 
 # Contents
 
-* `PINNs/` — PINN implementations
-* `NN/` — Data-only models
-* `Exps/` — training and evaluation scripts
-* `Utils/` — helper functions
+* `PINNs/` — PINN models
+* `NN/` — data-only models
+* `Exps/` — inference, and evaluation scripts
+* `Utils/` — helper scripts
 
 # Features
 
