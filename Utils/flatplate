@@ -1,1 +1,356 @@
+## Ansys APDL script for repetitive loading on nodes/keypoints for a flatplate
+
+/PREP7
+Knum=0
+*DO ,i,0,10
+ *DO ,j,0,10
+  Knum= Knum+1
+  x= j*100
+  y= x*100
+  k,Knum,x,y,0
+ *ENDDO
+*ENDDO
+
+/prep7
+nsel,all
+nsel,kp,,47
+*get,nid,node,0,num,max
+nsel,all
+f,nid,fz,-10000  
+/solu
+antype,static
+solve
+finish
+
+*DO,Knum,1,121
+ /PREP7
+ FKDELE,ALL,ALL,ALL
+ F,Knum,FZ,-10000
+ FINISH
+
+ /FILNAME, CASE%CHRVAL(Knum)%
+ /SOLU
+ SOLVE
+ FINISH
+
+ SAVE
+*ENDDO
+
+
+
+
+## Extractor for Displacement from APDL nodal solution
+
+import os
+import re
+import pandas as pd
+
+# ==== CONFIGURE PATHS HERE ====
+input_path = r"/mnt/c/Users/Srive/Desktop/APDL/Data/Disp/list"
+output_path = r"/mnt/c/Users/Srive/Desktop/APDL/Data/Disp/extract"
+
+# ==== END CONFIGURATION ====
+
+def extract_usum_fixed_paths(input_folder, output_folder):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        print(f"Created output folder: {output_folder}")
+
+    # Get all files in the input folder (non-recursive)
+    all_files = [os.path.join(input_folder, f) for f in os.listdir(input_folder)
+                 if os.path.isfile(os.path.join(input_folder, f))]
+
+    if not all_files:
+        print(" No files found in input folder!")
+        return
+
+    print(f" Found {len(all_files)} files. Processing...")
+
+    for file_path in all_files:
+        file_name = os.path.basename(file_path)
+        node_lines = []
+        with open(file_path, "r", errors="ignore") as f:
+            for line in f:
+                if re.match(r'^\s*\d+', line):
+                    node_lines.append(line.strip())
+
+        if not node_lines:
+            print(f" No node lines found in {file_name}. Skipping.")
+            continue
+
+        node_data = []
+        for line in node_lines:
+            parts = line.split()
+            if len(parts) >= 5:
+                try:
+                    node = int(parts[0])
+                    displacement = float(parts[4])
+                    node_data.append([node, displacement])
+                except ValueError:
+                    pass
+
+        if not node_data:
+            print(f" No valid data in {file_name}. Skipping.")
+            continue
+
+        df = pd.DataFrame(node_data, columns=["NODE", "DISPLACEMENT"])
+
+        # Determine output CSV name as 1.csv, 2.csv, ...
+        base_index = os.path.splitext(file_name)[0]
+        try:
+            # Try to convert original file name to int
+            csv_index = int(base_index)
+        except ValueError:
+            # Fallback: use order in list
+            csv_index = all_files.index(file_path) + 1
+
+        output_csv = os.path.join(output_folder, f"{csv_index}.csv")
+        df.to_csv(output_csv, index=False)
+        print(f" Saved {output_csv}")
+
+    print("\n All files processed successfully!")
+
+if __name__ == "__main__":
+    extract_usum_fixed_paths(input_path, output_path)
+
+
+
+
+## Combiner for Displacement from Extracted data
+
+import pandas as pd
+import os
+import glob
+import re
+
+# === USER DEFINED PATHS ===
+klist_path = "/home/ved/projects/Klist2.csv"
+usum_folder = "/mnt/c/Users/Srive/Desktop/APDL/Data/validation441disp/extract"
+output_path = "/mnt/c/Users/Srive/Desktop/APDL/Data/Disp/Combined2.xlsx"
+
+# === LOAD KLIST ===
+klist_df = pd.read_csv(klist_path)
+klist_df.columns = klist_df.columns.str.strip().str.lower()
+
+# Prepare column headers: "Case" + Keypoints
+headers = ["Case"] + klist_df['keypoint'].astype(str).tolist()
+
+# === GET ALL USUM FILES IN FOLDER ===
+usum_files = glob.glob(os.path.join(usum_folder, "*.csv"))
+# Skip Klist.csv itself if in the folder
+usum_files = [f for f in usum_files if os.path.basename(f).lower() != "klist.csv"]
+
+if not usum_files:
+    raise FileNotFoundError(f"No CSV files found in folder: {usum_folder}")
+
+# === NUMERIC SORT FUNCTION ===
+def numeric_sort_key(file_path):
+    filename = os.path.basename(file_path)
+    nums = re.findall(r'\d+', filename)
+    return int(nums[0]) if nums else float('inf')
+
+# Sort files numerically based on the first number in filename
+usum_files = sorted(usum_files, key=numeric_sort_key)
+
+# === PROCESS FILES ===
+all_rows = []
+
+for usum_file in usum_files:
+    usum_df = pd.read_csv(usum_file)
+    usum_df.columns = usum_df.columns.str.strip().str.lower()
+
+    # Detect displacement column (any column not 'node')
+    displacement_cols = [col for col in usum_df.columns if col != 'node']
+    if not displacement_cols:
+        raise ValueError(f"No displacement column found in file: {usum_file}")
+    disp_col = displacement_cols[0]
+
+    # Merge with Klist to preserve order
+    merged_df = klist_df.merge(usum_df, on='node', how='left')
+
+    # Prepare row: first cell = file name, rest = displacements
+    case_name = os.path.splitext(os.path.basename(usum_file))[0]
+    case_row = [case_name] + merged_df[disp_col].tolist()
+    all_rows.append(case_row)
+
+# === CREATE FINAL DATAFRAME ===
+final_df = pd.DataFrame(all_rows, columns=headers)
+
+# Make sure output directory exists
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+# Save to Excel
+final_df.to_excel(output_path, index=False)
+
+print(f" Excel file created with {len(usum_files)} cases at:\n{output_path}")
+
+
+
+
+
+## Extractor for Stress from APDL nodal solution
+
+import os
+import re
+import pandas as pd
+
+# ==== CONFIGURE PATHS HERE ====
+input_path = r"/mnt/c/Users/Srive/Desktop/APDL/Data/Stress/list"
+output_path = r"/mnt/c/Users/Srive/Desktop/APDL/Data/Stress/extract"
+
+# ==== END CONFIGURATION ====
+
+def extract_seqv_fixed_paths(input_folder, output_folder):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        print(f"Created output folder: {output_folder}")
+
+    # Get all files in the input folder (non-recursive)
+    all_files = [os.path.join(input_folder, f) for f in os.listdir(input_folder)
+                 if os.path.isfile(os.path.join(input_folder, f))]
+
+    if not all_files:
+        print(" No files found in input folder!")
+        return
+
+    print(f" Found {len(all_files)} files. Processing...")
+
+    for file_path in all_files:
+        file_name = os.path.basename(file_path)
+        node_lines = []
+        with open(file_path, "r", errors="ignore") as f:
+            for line in f:
+                if re.match(r'^\s*\d+', line):
+                    node_lines.append(line.strip())
+
+        if not node_lines:
+            print(f" No node lines found in {file_name}. Skipping.")
+            continue
+
+        node_data = []
+        seen_nodes = set()  # to skip duplicate nodes
+        for line in node_lines:
+            parts = line.split()
+            if len(parts) >= 6:
+                try:
+                    node = int(parts[0])
+                    if node in seen_nodes:
+                        continue  # skip duplicates
+                    seqv = float(parts[5])  # SEQV is column 6
+                    node_data.append([node, seqv])
+                    seen_nodes.add(node)
+                except ValueError:
+                    pass
+
+        if not node_data:
+            print(f" No valid data in {file_name}. Skipping.")
+            continue
+
+        df = pd.DataFrame(node_data, columns=["NODE", "SEQV"])
+
+        # Determine output CSV name as 1.csv, 2.csv, ...
+        base_index = os.path.splitext(file_name)[0]
+        try:
+            csv_index = int(base_index)
+        except ValueError:
+            csv_index = all_files.index(file_path) + 1
+
+        output_csv = os.path.join(output_folder, f"{csv_index}.csv")
+        df.to_csv(output_csv, index=False)
+        print(f" Saved {output_csv}")
+
+    print("\n All files processed successfully!")
+
+if __name__ == "__main__":
+    extract_seqv_fixed_paths(input_path, output_path)
+
+
+
+
+## Combiner for Stress from Extracted data
+
+import pandas as pd
+import os
+import glob
+import re
+
+# === USER DEFINED PATHS ===
+klist_path = "/home/ved/projects/Klist2.csv"
+usum_folder = "/mnt/c/Users/Srive/Desktop/APDL/Data/validation441stress/extract"
+output_path = "/mnt/c/Users/Srive/Desktop/APDL/Data/validation441stress/Combined2.xlsx"
+
+# === LOAD KLIST ===
+klist_df = pd.read_csv(klist_path)
+klist_df.columns = klist_df.columns.str.strip().str.lower()
+
+# Prepare column headers: "Case" + Keypoints
+headers = ["Case"] + klist_df['keypoint'].astype(str).tolist()
+
+# === GET ALL USUM FILES IN FOLDER ===
+usum_files = glob.glob(os.path.join(usum_folder, "*.csv"))
+# Skip Klist.csv itself if in the folder
+usum_files = [f for f in usum_files if os.path.basename(f).lower() != "klist.csv"]
+
+if not usum_files:
+    raise FileNotFoundError(f"No CSV files found in folder: {usum_folder}")
+
+# === NUMERIC SORT FUNCTION ===
+def numeric_sort_key(file_path):
+    filename = os.path.basename(file_path)
+    nums = re.findall(r'\d+', filename)
+    return int(nums[0]) if nums else float('inf')
+
+# Sort files numerically based on the first number in filename
+usum_files = sorted(usum_files, key=numeric_sort_key)
+
+# === PROCESS FILES ===
+all_rows = []
+
+for usum_file in usum_files:
+    usum_df = pd.read_csv(usum_file)
+    usum_df.columns = usum_df.columns.str.strip().str.lower()
+
+    # Detect displacement column (any column not 'node')
+    displacement_cols = [col for col in usum_df.columns if col != 'node']
+    if not displacement_cols:
+        raise ValueError(f"No displacement column found in file: {usum_file}")
+    disp_col = displacement_cols[0]
+
+    # Merge with Klist to preserve order
+    merged_df = klist_df.merge(usum_df, on='node', how='left')
+
+    # Prepare row: first cell = file name, rest = displacements
+    case_name = os.path.splitext(os.path.basename(usum_file))[0]
+    case_row = [case_name] + merged_df[disp_col].tolist()
+    all_rows.append(case_row)
+
+# === CREATE FINAL DATAFRAME ===
+final_df = pd.DataFrame(all_rows, columns=headers)
+
+# Make sure output directory exists
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+# Save to Excel
+final_df.to_excel(output_path, index=False)
+
+print(f" Excel file created with {len(usum_files)} cases at:\n{output_path}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
