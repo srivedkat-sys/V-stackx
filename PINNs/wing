@@ -1,4 +1,4 @@
-## Also contains a small inference at the end for quick reference
+## PINN Wing model with a small inference for quick reference
 
 import torch
 import torch.nn as nn
