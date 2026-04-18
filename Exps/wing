@@ -872,3 +872,306 @@ for i, case in enumerate(cases):
 
     plt.show()
 
+
+
+## Mesh Convergence study (Top Surface)
+
+import pandas as pd
+import numpy as np
+
+# ==========================================================
+# USER INPUTS
+# ==========================================================
+
+BASE_PATH = "/home/ved/wing/"
+
+mesh_files = {
+    "10mm":  BASE_PATH + "stresstop10mm.txt",
+    "5mm":   BASE_PATH + "stresstop5mm.txt",
+    "2.5mm": BASE_PATH + "stresstop2.5mm.txt",
+    "1mm":   BASE_PATH + "stresstop1mm.txt",
+}
+
+OUTPUT_EXCEL = BASE_PATH + "mesh_convergence_tension_top_surface.xlsx"
+
+N_SPAN_POINTS = 10
+Z_MIN_EXCLUDE = 50
+Z_MAX_EXCLUDE = 1300
+
+# ==========================================================
+# LOAD & CLEAN DATA
+# ==========================================================
+
+meshes = {}
+
+for label, path in mesh_files.items():
+    df = pd.read_csv(path, sep=r"\s+", engine="python", header=None)
+    df = df.iloc[:, :4]
+    df.columns = ["X", "Y", "Z", "Stress"]
+
+    for col in ["X", "Y", "Z", "Stress"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna()
+    meshes[label] = df
+
+# ==========================================================
+# BUILD TOP SURFACE FROM 10mm MESH 
+# ==========================================================
+
+ref = meshes["10mm"]
+
+# restrict to intermediate span
+ref = ref[
+    (ref["Z"] > Z_MIN_EXCLUDE) &
+    (ref["Z"] < Z_MAX_EXCLUDE)
+]
+
+# for each Z, take the point with maximum Y (top surface)
+ref_top = (
+    ref.sort_values("Y", ascending=False)
+       .groupby("Z", as_index=False)
+       .first()
+)
+
+# keep only tension
+ref_top = ref_top[ref_top["Stress"] > 0]
+
+if len(ref_top) < N_SPAN_POINTS:
+    raise RuntimeError(
+        f"Only {len(ref_top)} tensile top-surface points found in 10mm mesh."
+    )
+
+# ==========================================================
+# SELECT EXACTLY 10 SPANWISE LOCATIONS
+# ==========================================================
+
+ref_top = ref_top.sort_values("Z")
+
+Z_targets = np.linspace(
+    ref_top["Z"].min(),
+    ref_top["Z"].max(),
+    N_SPAN_POINTS
+)
+
+ref_samples = []
+for Zt in Z_targets:
+    idx = (ref_top["Z"] - Zt).abs().idxmin()
+    ref_samples.append(ref_top.loc[idx])
+
+ref_samples = pd.DataFrame(ref_samples)
+
+# ==========================================================
+# CONVERGENCE COMPARISON
+# ==========================================================
+
+rows = []
+
+for _, r in ref_samples.iterrows():
+    Xr, Yr, Zr, Sr = r["X"], r["Y"], r["Z"], r["Stress"]
+
+    row = {
+        "X (mm)": Xr,
+        "Y (mm)": Yr,
+        "Z (mm)": Zr,
+        "Stress 10mm (MPa)": Sr
+    }
+
+    stresses = {"10mm": Sr}
+
+    for label, df in meshes.items():
+        if label == "10mm":
+            continue
+
+        dist = (
+            (df["X"] - Xr)**2 +
+            (df["Y"] - Yr)**2 +
+            (df["Z"] - Zr)**2
+        )
+
+        idx = dist.idxmin()
+        s = df.loc[idx, "Stress"]
+
+        if s <= 0:
+            s = np.nan
+
+        stresses[label] = s
+        row[f"Stress {label} (MPa)"] = s
+
+    labels = list(mesh_files.keys())
+    for i in range(len(labels) - 1):
+        s1 = stresses.get(labels[i])
+        s2 = stresses.get(labels[i + 1])
+
+        if not np.isnan(s1) and not np.isnan(s2):
+            row[f"|Δσ| ({labels[i]} → {labels[i+1]})"] = abs(s2 - s1)
+        else:
+            row[f"|Δσ| ({labels[i]} → {labels[i+1]})"] = np.nan
+
+    rows.append(row)
+
+# ==========================================================
+# EXPORT
+# ==========================================================
+
+df_out = pd.DataFrame(rows)
+df_out.to_excel(OUTPUT_EXCEL, index=False)
+
+print("\nTension-only top-surface convergence completed.")
+print("Rows written:", len(df_out))
+print("Output file:", OUTPUT_EXCEL)
+print("\nPreview:")
+print(df_out)
+
+
+
+## Mesh Convergence study (Bottom surface)
+
+import pandas as pd
+import numpy as np
+
+# ==========================================================
+# USER INPUTS
+# ==========================================================
+
+BASE_PATH = "/home/ved/wing/"
+
+mesh_files = {
+    "10mm":  BASE_PATH + "stressbottom10mm.txt",
+    "5mm":   BASE_PATH + "stressbottom5mm.txt",
+    "2.5mm": BASE_PATH + "stressbottom2.5mm.txt",
+    "1mm":   BASE_PATH + "stressbottom1mm.txt",
+}
+
+OUTPUT_EXCEL = BASE_PATH + "mesh_convergence_compression_bottom_surface.xlsx"
+
+N_SPAN_POINTS = 10
+Z_MIN_EXCLUDE = 50
+Z_MAX_EXCLUDE = 1300
+
+# ==========================================================
+# LOAD & CLEAN DATA
+# ==========================================================
+
+meshes = {}
+
+for label, path in mesh_files.items():
+    df = pd.read_csv(path, sep=r"\s+", engine="python", header=None)
+    df = df.iloc[:, :4]
+    df.columns = ["X", "Y", "Z", "Stress"]
+
+    for col in ["X", "Y", "Z", "Stress"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna()
+    meshes[label] = df
+
+# ==========================================================
+# BUILD BOTTOM SURFACE FROM 10mm MESH (MIN Y)
+# ==========================================================
+
+ref = meshes["10mm"]
+
+# restrict to intermediate span
+ref = ref[
+    (ref["Z"] > Z_MIN_EXCLUDE) &
+    (ref["Z"] < Z_MAX_EXCLUDE)
+]
+
+# for each Z, take point with minimum Y (bottom surface)
+ref_bottom = (
+    ref.sort_values("Y", ascending=True)
+       .groupby("Z", as_index=False)
+       .first()
+)
+
+# keep only compression
+ref_bottom = ref_bottom[ref_bottom["Stress"] < 0]
+
+if len(ref_bottom) < N_SPAN_POINTS:
+    raise RuntimeError(
+        f"Only {len(ref_bottom)} compressive bottom-surface points found in 10mm mesh."
+    )
+
+# ==========================================================
+# SELECT EXACTLY 10 SPANWISE LOCATIONS
+# ==========================================================
+
+ref_bottom = ref_bottom.sort_values("Z")
+
+Z_targets = np.linspace(
+    ref_bottom["Z"].min(),
+    ref_bottom["Z"].max(),
+    N_SPAN_POINTS
+)
+
+ref_samples = []
+for Zt in Z_targets:
+    idx = (ref_bottom["Z"] - Zt).abs().idxmin()
+    ref_samples.append(ref_bottom.loc[idx])
+
+ref_samples = pd.DataFrame(ref_samples)
+
+# ==========================================================
+# CONVERGENCE COMPARISON
+# ==========================================================
+
+rows = []
+
+for _, r in ref_samples.iterrows():
+    Xr, Yr, Zr, Sr = r["X"], r["Y"], r["Z"], r["Stress"]
+
+    row = {
+        "X (mm)": Xr,
+        "Y (mm)": Yr,
+        "Z (mm)": Zr,
+        "Stress 10mm (MPa)": Sr
+    }
+
+    stresses = {"10mm": Sr}
+
+    for label, df in meshes.items():
+        if label == "10mm":
+            continue
+
+        dist = (
+            (df["X"] - Xr)**2 +
+            (df["Y"] - Yr)**2 +
+            (df["Z"] - Zr)**2
+        )
+
+        idx = dist.idxmin()
+        s = df.loc[idx, "Stress"]
+
+        # keep compression only
+        if s >= 0:
+            s = np.nan
+
+        stresses[label] = s
+        row[f"Stress {label} (MPa)"] = s
+
+    labels = list(mesh_files.keys())
+    for i in range(len(labels) - 1):
+        s1 = stresses.get(labels[i])
+        s2 = stresses.get(labels[i + 1])
+
+        if not np.isnan(s1) and not np.isnan(s2):
+            row[f"|Δσ| ({labels[i]} → {labels[i+1]})"] = abs(s2 - s1)
+        else:
+            row[f"|Δσ| ({labels[i]} → {labels[i+1]})"] = np.nan
+
+    rows.append(row)
+
+# ==========================================================
+# EXPORT
+# ==========================================================
+
+df_out = pd.DataFrame(rows)
+df_out.to_excel(OUTPUT_EXCEL, index=False)
+
+print("\nCompression-only bottom-surface convergence completed.")
+print("Rows written:", len(df_out))
+print("Output file:", OUTPUT_EXCEL)
+print("\nPreview:")
+print(df_out)
+
