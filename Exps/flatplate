@@ -1,1 +1,1097 @@
-##j
+### Displacement
+## 121 output variable metrics 
+
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import MinMaxScaler
+
+# =====================
+# Paths
+# =====================
+project_dir = "/home/ved/projects"
+coord_path = os.path.join(project_dir, "Coordinate.csv")
+data_path  = os.path.join(project_dir, "Data2.csv")
+
+# =====================
+# Load data
+# =====================
+coords = pd.read_csv(coord_path)
+data   = pd.read_csv(data_path)
+
+# Inputs
+X = coords[['X','Y']].values     # shape (n_points, 2)
+y_disp = data.filter(regex='^N\d+').values  # only displacements
+
+print(f"Forward output shape: {y_disp.shape}")
+
+# =====================
+# Normalize displacement (forward)
+# =====================
+disp_scaler = MinMaxScaler()
+y_disp_scaled = disp_scaler.fit_transform(y_disp)
+
+# Normalize coordinates (inverse)
+coord_scaler = MinMaxScaler()
+X_scaled = coord_scaler.fit_transform(X)
+
+# Convert to tensors
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y_disp_scaled, dtype=torch.float32)
+
+X_scaled_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+y_scaled_tensor = torch.tensor(y_disp_scaled, dtype=torch.float32)
+
+# =====================
+# MLP Model
+# =====================
+class MLP(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(in_features, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, out_features)
+        )
+    def forward(self, x):
+        return self.model(x)
+
+# =====================
+# Instantiate models
+# =====================
+forward_model = MLP(in_features=2, out_features=y_disp.shape[1])
+inverse_model = MLP(in_features=1, out_features=2)  # input: max displacement value
+
+# Loss and optimizer
+criterion = nn.MSELoss()
+fwd_optimizer = optim.Adam(forward_model.parameters(), lr=1e-3)
+inv_optimizer = optim.Adam(inverse_model.parameters(), lr=1e-3)
+
+# =====================
+# Training forward model
+# =====================
+epochs = 8000
+print("Training forward model...")
+for epoch in range(epochs):
+    fwd_optimizer.zero_grad()
+    outputs = forward_model(X_tensor)
+    loss = criterion(outputs, y_tensor)
+    loss.backward()
+    fwd_optimizer.step()
+    if epoch % 500 == 0 or epoch == epochs-1:
+        print(f"[Forward] Epoch {epoch}, Loss: {loss.item():.6f}")
+
+
+print("\nRunning validation...")
+
+val_path = os.path.join(project_dir, "validation121disp.csv")
+val_df = pd.read_csv(val_path)
+
+# Extract XY inputs
+val_X = val_df[['X', 'Y']].values
+
+# Select only N1…N121
+disp_cols = [f"N{i}" for i in range(1, 122)]
+val_y_true = val_df[disp_cols].values
+
+# Scale coordinates
+val_X_scaled = coord_scaler.transform(val_X)
+val_X_scaled_tensor = torch.tensor(val_X_scaled, dtype=torch.float32)
+
+# Predict
+forward_model.eval()
+with torch.no_grad():
+    val_pred_scaled = forward_model(val_X_scaled_tensor).numpy()
+
+# Inverse scale
+val_pred = disp_scaler.inverse_transform(val_pred_scaled)
+
+# Absolute errors for each of the 121 points
+abs_errors = np.abs(val_pred - val_y_true)
+
+# Mean & Max error per row
+mean_errors = np.mean(abs_errors, axis=1)
+max_errors  = np.max(abs_errors, axis=1)
+
+# ----- Correct Max Error Percent -----
+# Max true displacement per row
+true_max = np.max(np.abs(val_y_true), axis=1)
+
+# Avoid division by zero
+true_max_safe = np.where(true_max == 0, 1e-12, true_max)
+
+# Correct percentage formula
+max_error_pct = (max_errors / true_max_safe) * 100
+
+# Final results table
+val_results = pd.DataFrame({
+    'X': val_X[:, 0],
+    'Y': val_X[:, 1],
+    'MeanError': mean_errors,
+    'MaxError': max_errors,
+    'MaxErrorPct': max_error_pct
+})
+
+print("\nValidation Results (X, Y, MeanError, MaxError, MaxErrorPct):")
+print(val_results.to_string(index=False))
+
+# Save results
+save_path = os.path.join(project_dir, "validation_errors.csv")
+val_results.to_csv(save_path, index=False)
+print(f"\nSaved validation error table to {save_path}")
+
+
+## Performance Metrics ##
+# Primary Metrics #
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import numpy as np
+
+# Flatten all predictions & true values
+y_true_all = val_y_true.flatten()
+y_pred_all = val_pred.flatten()
+
+# ---- Primary Accuracy Metrics ----
+MAE = mean_absolute_error(y_true_all, y_pred_all)
+RMSE = np.sqrt(mean_squared_error(y_true_all, y_pred_all))
+
+# Relative L2 error
+Rel_L2 = np.linalg.norm(y_true_all - y_pred_all) / np.linalg.norm(y_true_all)
+
+# Max Error (L∞)
+Max_Error = np.max(np.abs(y_true_all - y_pred_all))
+
+# R² score
+R2 = r2_score(y_true_all, y_pred_all)
+
+print("\n===== Primary Accuracy Metrics =====")
+print(f"MAE       : {MAE:.6f}")
+print(f"RMSE      : {RMSE:.6f}")
+print(f"Rel_L2    : {Rel_L2:.6f}")
+print(f"Max Error : {Max_Error:.6f}")
+print(f"R2 Score  : {R2:.6f}")
+
+# ============================================================
+# STATISTICAL VALIDATION (SV) – RESIDUAL ANALYSIS
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from statsmodels.graphics.gofplots import qqplot
+from statsmodels.stats.stattools import durbin_watson
+
+# ------------------------------------------------------------
+# 1. Compute Residuals
+# ------------------------------------------------------------
+residuals = (val_pred - val_y_true).flatten()
+
+print("\n==============================")
+print(" Statistical Validation (SV)")
+print("==============================")
+print(f"Total residual samples = {len(residuals)}")
+
+
+# ------------------------------------------------------------
+# 2. Histogram + PDF
+# ------------------------------------------------------------
+plt.figure(figsize=(7,5))
+count, bins, _ = plt.hist(residuals, bins=40, density=True, alpha=0.6, color='gray', label="Residuals")
+
+# Fit Gaussian PDF
+mu, sigma = np.mean(residuals), np.std(residuals)
+pdf = stats.norm.pdf(bins, mu, sigma)
+plt.plot(bins, pdf, 'r-', label=f'Normal PDF (μ={mu:.4f}, σ={sigma:.4f})')
+
+plt.title("Residual Histogram + Fitted Normal PDF")
+plt.xlabel("Residual")
+plt.ylabel("Density")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+# ------------------------------------------------------------
+# 3. Q–Q Plot
+# ------------------------------------------------------------
+plt.figure(figsize=(6,6))
+qqplot(residuals, line='45')
+plt.title("Q–Q Plot of Residuals")
+plt.grid(True)
+plt.show()
+
+
+# ------------------------------------------------------------
+# 4. Kolmogorov–Smirnov (KS) Test for Normality
+# ------------------------------------------------------------
+ks_stat, ks_p = stats.kstest(residuals, 'norm', args=(mu, sigma))
+
+# ------------------------------------------------------------
+# 5. Shapiro–Wilk Test
+# ------------------------------------------------------------
+shapiro_stat, shapiro_p = stats.shapiro(residuals[:5000])  # SW limit ~5000 samples
+
+# ------------------------------------------------------------
+# 6. Anderson–Darling Test
+# ------------------------------------------------------------
+ad_result = stats.anderson(residuals, dist='norm')
+
+# ------------------------------------------------------------
+# 7. Jarque–Bera Test
+# ------------------------------------------------------------
+jb_stat, jb_p = stats.jarque_bera(residuals)
+
+# ------------------------------------------------------------
+# 8. Skewness & Kurtosis
+# ------------------------------------------------------------
+skew_val  = stats.skew(residuals)
+kurt_val  = stats.kurtosis(residuals)
+
+# ------------------------------------------------------------
+# 9. Durbin–Watson Autocorrelation Test
+# ------------------------------------------------------------
+dw_stat = durbin_watson(residuals)
+
+# ------------------------------------------------------------
+# PRINT SUMMARY
+# ------------------------------------------------------------
+print("\n--- Residual Statistics ---")
+print(f"Mean     : {mu:.6f}")
+print(f"Std Dev  : {sigma:.6f}")
+print(f"Skewness : {skew_val:.6f}")
+print(f"Kurtosis : {kurt_val:.6f}")
+
+print("\n--- Normality Tests ---")
+print(f"KS Test        : stat={ks_stat:.6f}, p={ks_p:.6f}")
+print(f"Shapiro-Wilk   : stat={shapiro_stat:.6f}, p={shapiro_p:.6f}")
+print(f"Jarque-Bera    : stat={jb_stat:.6f}, p={jb_p:.6f}")
+
+print("\n--- Anderson-Darling Test ---")
+print(f"Statistic: {ad_result.statistic:.6f}")
+for sig, crit in zip(ad_result.significance_level, ad_result.critical_values):
+    print(f"  {sig:.1f}% significance level: critical value={crit:.6f}")
+
+print("\n--- Autocorrelation ---")
+print(f"Durbin-Watson: {dw_stat:.6f}")
+print("DW ≈ 2 means no autocorrelation. <2 positive correlation, >2 negative correlation.")
+
+print("\nSV analysis complete.")
+
+
+
+
+## 441 output variable metrics
+
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import MinMaxScaler
+
+# =====================
+# Paths
+# =====================
+project_dir = "/home/ved/projects"
+coord_path = os.path.join(project_dir, "Coordinate2.csv")
+data_path  = os.path.join(project_dir, "Data3.csv")
+
+# =====================
+# Load data
+# =====================
+coords = pd.read_csv(coord_path)
+data   = pd.read_csv(data_path)
+
+# Inputs
+X = coords[['X','Y']].values                # shape (n_points, 2)
+
+# ---- UPDATED FOR 441 OUTPUTS ----
+disp_cols = [f"N{i}" for i in range(1, 442)]
+y_disp = data[disp_cols].values             # shape (n_points, 441)
+
+print(f"Forward output shape: {y_disp.shape}")
+
+# =====================
+# Normalize displacement (forward)
+# =====================
+disp_scaler = MinMaxScaler()
+y_disp_scaled = disp_scaler.fit_transform(y_disp)
+
+# Normalize coordinates (inverse)
+coord_scaler = MinMaxScaler()
+X_scaled = coord_scaler.fit_transform(X)
+
+# Convert to tensors
+X_tensor = torch.tensor(X, dtype=torch.float32)
+y_tensor = torch.tensor(y_disp_scaled, dtype=torch.float32)
+
+X_scaled_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+y_scaled_tensor = torch.tensor(y_disp_scaled, dtype=torch.float32)
+
+# =====================
+# MLP Model
+# =====================
+class MLP(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(in_features, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, out_features)
+        )
+    def forward(self, x):
+        return self.model(x)
+
+# =====================
+# Instantiate model
+# =====================
+forward_model = MLP(in_features=2, out_features=y_disp.shape[1])
+
+criterion = nn.MSELoss()
+fwd_optimizer = optim.Adam(forward_model.parameters(), lr=1e-3)
+
+# =====================
+# Training forward model
+# =====================
+epochs = 8000
+print("Training forward model...")
+for epoch in range(epochs):
+    fwd_optimizer.zero_grad()
+
+    outputs = forward_model(X_tensor)
+    loss = criterion(outputs, y_tensor)
+    loss.backward()
+    fwd_optimizer.step()
+
+    if epoch % 500 == 0 or epoch == epochs-1:
+        print(f"[Forward] Epoch {epoch}, Loss: {loss.item():.6f}")
+
+
+# =========================================================
+#                  VALIDATION UPDATED FOR 441 NODES
+# =========================================================
+print("\nRunning validation...")
+
+val_path = os.path.join(project_dir, "validation441disp.csv")
+val_df = pd.read_csv(val_path)
+
+# Extract XY inputs
+val_X = val_df[['X', 'Y']].values
+
+# ---- UPDATED: Take N1…N441 ----
+disp_cols_val = [f"N{i}" for i in range(1, 442)]
+val_y_true = val_df[disp_cols_val].values     # shape (n_val, 441)
+
+# Scale coordinates
+val_X_scaled = coord_scaler.transform(val_X)
+val_X_scaled_tensor = torch.tensor(val_X_scaled, dtype=torch.float32)
+
+# Predict
+forward_model.eval()
+with torch.no_grad():
+    val_pred_scaled = forward_model(val_X_scaled_tensor).numpy()
+
+# Inverse scale
+val_pred = disp_scaler.inverse_transform(val_pred_scaled)
+
+# Absolute errors for each of the 441 points
+abs_errors = np.abs(val_pred - val_y_true)
+
+# Mean & Max error per test case
+mean_errors = np.mean(abs_errors, axis=1)
+max_errors  = np.max(abs_errors, axis=1)
+
+# Max true displacement per row
+true_max = np.max(np.abs(val_y_true), axis=1)
+true_max_safe = np.where(true_max == 0, 1e-12, true_max)
+
+# Correct percentage error
+max_error_pct = (max_errors / true_max_safe) * 100
+
+# Final results table
+val_results = pd.DataFrame({
+    'X': val_X[:, 0],
+    'Y': val_X[:, 1],
+    'MeanError': mean_errors,
+    'MaxError': max_errors,
+    'MaxErrorPct': max_error_pct
+})
+
+print("\nValidation Results (X, Y, MeanError, MaxError, MaxErrorPct):")
+print(val_results.to_string(index=False))
+
+# Save results
+save_path = os.path.join(project_dir, "validation_errors_441.csv")
+val_results.to_csv(save_path, index=False)
+
+print(f"\nSaved validation error table to {save_path}")
+
+from sklearn.metrics import mean_squared_error, r2_score
+
+# ----------------------------
+# Deterministic Global Metrics
+# ----------------------------
+y_true_flat = val_y_true.flatten()
+y_pred_flat = val_pred.flatten()
+
+MAE = np.mean(np.abs(y_true_flat - y_pred_flat))
+RMSE = np.sqrt(mean_squared_error(y_true_flat, y_pred_flat))
+RelL2 = np.linalg.norm(y_pred_flat - y_true_flat) / np.linalg.norm(y_true_flat)
+MaxErr = np.max(np.abs(y_pred_flat - y_true_flat))
+R2 = r2_score(y_true_flat, y_pred_flat)
+
+print("\n===== Deterministic Metrics (441 nodes) =====")
+print(f"MAE       : {MAE:.6f}")
+print(f"RMSE      : {RMSE:.6f}")
+print(f"Rel L2    : {RelL2:.6f}")
+print(f"Max Error : {MaxErr:.6f}")
+print(f"R2 Score  : {R2:.6f}")
+
+import copy
+
+print("\n==============================")
+print("   Training 20 Ensemble Models")
+print("==============================")
+
+num_ens = 20
+ensemble_preds = []
+
+for m in range(num_ens):
+    print(f"> Model {m+1}/{num_ens}")
+
+    model_ens = MLP(in_features=2, out_features=y_disp.shape[1])
+    opt_ens = optim.Adam(model_ens.parameters(), lr=1e-3)
+
+    # quick retrain (400 epochs is enough)
+    for epoch in range(400):
+        opt_ens.zero_grad()
+        pred_e = model_ens(X_tensor)
+        loss_e = criterion(pred_e, y_tensor)
+        loss_e.backward()
+        opt_ens.step()
+
+    # predict on validation
+    model_ens.eval()
+    with torch.no_grad():
+        pred_scaled = model_ens(val_X_scaled_tensor).numpy()
+    pred = disp_scaler.inverse_transform(pred_scaled)
+
+    ensemble_preds.append(pred)
+
+ensemble_preds = np.array(ensemble_preds)        # shape (20, Nval, 441)
+uq_std = np.std(ensemble_preds, axis=0)          # (Nval, 441)
+uq_pointwise = np.max(uq_std, axis=1)            # max UQ per test sample
+
+# Negative Log Likelihood
+eps = 1e-12
+var = np.var(ensemble_preds, axis=0) + eps
+NLL = np.mean(0.5 * np.log(var) + (val_y_true - np.mean(ensemble_preds, axis=0))**2 / (2*var))
+
+print("\n===== Ensemble UQ Metrics =====")
+print(f"Predictive Std (mean): {np.mean(uq_std):.6f}")
+print(f"NLL: {NLL:.6f}")
+
+from scipy.stats import kstest, shapiro, jarque_bera, anderson
+from statsmodels.stats.stattools import durbin_watson
+
+print("\n==============================")
+print(" Statistical Validation (SV)  ")
+print("==============================")
+
+residuals = y_pred_flat - y_true_flat
+
+print(f"Total residual samples = {len(residuals)}\n")
+
+# --- Residual Stats ---
+mean_r = np.mean(residuals)
+std_r = np.std(residuals)
+skew_r = pd.Series(residuals).skew()
+kurt_r = pd.Series(residuals).kurtosis()
+
+print("--- Residual Statistics ---")
+print(f"Mean     : {mean_r:.6f}")
+print(f"Std Dev  : {std_r:.6f}")
+print(f"Skewness : {skew_r:.6f}")
+print(f"Kurtosis : {kurt_r:.6f}\n")
+
+# --- Normality Tests ---
+ks_stat, ks_p = kstest(residuals, 'norm')
+sw_stat, sw_p = shapiro(residuals)
+jb_stat, jb_p = jarque_bera(residuals)
+
+print("--- Normality Tests ---")
+print(f"KS Test        : stat={ks_stat:.6f}, p={ks_p:.6f}")
+print(f"Shapiro-Wilk   : stat={sw_stat:.6f}, p={sw_p:.6f}")
+print(f"Jarque-Bera    : stat={jb_stat:.6f}, p={jb_p:.6f}\n")
+
+# --- Anderson-Darling ---
+ad_result = anderson(residuals)
+
+print("--- Anderson-Darling Test ---")
+print(f"Statistic: {ad_result.statistic:.6f}")
+for sl, cv in zip(ad_result.significance_level, ad_result.critical_values):
+    print(f"{sl}% significance level: critical value={cv}")
+print("")
+
+# --- Autocorrelation ---
+dw = durbin_watson(residuals)
+print("--- Autocorrelation ---")
+print(f"Durbin-Watson: {dw:.6f}")
+print("DW ≈ 2 means no autocorrelation. <2 positive correlation, >2 negative correlation.\n")
+
+save_all = {
+    "MAE": MAE,
+    "RMSE": RMSE,
+    "RelL2": RelL2,
+    "MaxError": MaxErr,
+    "R2": R2,
+    "UQ_PredictiveStd_mean": float(np.mean(uq_std)),
+    "UQ_NLL": float(NLL),
+    "Residual_Mean": mean_r,
+    "Residual_Std": std_r,
+    "Residual_Skew": skew_r,
+    "Residual_Kurtosis": kurt_r,
+    "KS_p": ks_p,
+    "SW_p": sw_p,
+    "JB_p": jb_p,
+    "DW": float(dw),
+}
+
+pd.DataFrame([save_all]).to_csv(
+    os.path.join(project_dir, "full_metrics_uq_sv_441.csv"),
+    index=False
+)
+
+print("\nSaved full evaluation to full_metrics_uq_sv_441.csv\n")
+
+# ==========================================================
+# Save full prediction + truth + UQ arrays for 441-node model
+# ==========================================================
+np.save(os.path.join(project_dir, "val_pred_441.npy"), val_pred)
+np.save(os.path.join(project_dir, "val_true_441.npy"), val_y_true)
+np.save(os.path.join(project_dir, "uq_std_441.npy"), uq_std)
+
+print("\nSaved 441-node data:")
+print(" - val_pred_441.npy")
+print(" - val_true_441.npy")
+print(" - uq_std_441.npy")
+
+
+
+
+
+### Stress
+## 121 output variable metrics
+
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# =======================
+# Load and preprocess data
+# =======================
+data = pd.read_csv("/home/ved/projects/Data2.csv")
+
+X = data[["X", "Y"]].values  # input load coordinates
+S_cols = [f"S{i}" for i in range(1, 122)]
+Y = data[S_cols].values      # stress at 121 points
+
+# Normalize input & output
+x_scaler = StandardScaler()
+y_scaler = StandardScaler()
+X = x_scaler.fit_transform(X)
+Y = y_scaler.fit_transform(Y)
+
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.1, random_state=42)
+
+# Convert to torch tensors
+X_train = torch.tensor(X_train, dtype=torch.float32)
+Y_train = torch.tensor(Y_train, dtype=torch.float32)
+X_test = torch.tensor(X_test, dtype=torch.float32)
+Y_test = torch.tensor(Y_test, dtype=torch.float32)
+
+# =======================
+# Define MLP model
+# =======================
+class MLP(nn.Module):
+    def __init__(self, in_dim=2, out_dim=121, hidden=[256, 256, 256, 256, 256]):
+        super().__init__()
+        layers = []
+        last = in_dim
+        for h in hidden:
+            layers.append(nn.Linear(last, h))
+            layers.append(nn.SiLU())
+            last = h
+        layers.append(nn.Linear(last, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+model = MLP()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+criterion = nn.MSELoss()
+
+# =======================
+# Train loop
+# =======================
+epochs = 1000
+for epoch in range(epochs):
+    model.train()
+    optimizer.zero_grad()
+    pred = model(X_train)
+    loss = criterion(pred, Y_train)
+    loss.backward()
+    optimizer.step()
+
+    if (epoch+1) % 50 == 0:
+        model.eval()
+        with torch.no_grad():
+            val_loss = criterion(model(X_test), Y_test)
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss={loss.item():.4e} | Val Loss={val_loss.item():.4e}")
+
+
+import numpy as np
+from sklearn.metrics import r2_score
+from scipy.stats import skew, kurtosis, kstest, shapiro, jarque_bera
+
+# ===============================
+# PREDICTION ON TEST SET
+# ===============================
+model.eval()
+with torch.no_grad():
+    pred_test = model(X_test).cpu().numpy()
+
+# Inverse-transform
+Y_test_true = y_scaler.inverse_transform(Y_test.cpu().numpy())
+Y_test_pred = y_scaler.inverse_transform(pred_test)
+
+# ===============================
+# 1. DETERMINISTIC METRICS
+# ===============================
+errors = Y_test_pred - Y_test_true
+
+MAE  = np.mean(np.abs(errors))
+RMSE = np.sqrt(np.mean(errors**2))
+Rel_L2 = np.linalg.norm(errors) / np.linalg.norm(Y_test_true)
+MaxErr = np.max(np.abs(errors))
+R2 = r2_score(Y_test_true.flatten(), Y_test_pred.flatten())
+
+print("\n===== Deterministic Metrics (Stress Model) =====")
+print(f"MAE      : {MAE:.6f}")
+print(f"RMSE     : {RMSE:.6f}")
+print(f"Rel L2   : {Rel_L2:.6f}")
+print(f"Max Error: {MaxErr:.6f}")
+print(f"R2 Score : {R2:.6f}")
+
+
+# ======================================================
+# 2. ENSEMBLE UQ  (20 MODELS WITH RANDOM INITIALIZATION)
+# ======================================================
+print("\n==============================")
+print(" Training 20 Ensemble Models")
+print("==============================")
+
+ensemble_preds = []
+
+for m in range(20):
+    print(f"> Model {m+1}/20")
+
+    mtemp = MLP()
+    opt = torch.optim.Adam(mtemp.parameters(), lr=1e-3)
+
+    # small quick training
+    for ep in range(300):
+        mtemp.train()
+        opt.zero_grad()
+        p = mtemp(X_train)
+        l = criterion(p, Y_train)
+        l.backward()
+        opt.step()
+
+    mtemp.eval()
+    with torch.no_grad():
+        ensemble_preds.append(
+            y_scaler.inverse_transform(mtemp(X_test).cpu().numpy())
+        )
+
+ensemble_preds = np.stack(ensemble_preds, axis=0)     # shape = (20, N, 121)
+pred_mean = np.mean(ensemble_preds, axis=0)           # mean prediction
+pred_std  = np.std(ensemble_preds, axis=0)            # per-point std
+
+
+# Ensemble predictive-variance metric (mean σ over all samples)
+UQ_mean_std = np.mean(pred_std)
+
+# Negative Log Likelihood (Gaussian)
+NLL = np.mean(0.5 * np.log(pred_std**2 + 1e-8) +
+              (Y_test_true - pred_mean)**2 / (2*(pred_std**2 + 1e-8)))
+
+print("\n===== Ensemble UQ Metrics =====")
+print(f"Predictive Std (mean): {UQ_mean_std:.6f}")
+print(f"NLL: {NLL:.6f}")
+
+
+# ======================================
+# 3. STATISTICAL VALIDATION (SV)
+# ======================================
+residuals = (Y_test_pred - Y_test_true).flatten()
+
+print("\n==============================")
+print(" Statistical Validation (SV)")
+print("==============================")
+
+print(f"Total residual samples = {len(residuals)}")
+
+print("\n--- Residual Statistics ---")
+print(f"Mean     : {np.mean(residuals):.6f}")
+print(f"Std Dev  : {np.std(residuals):.6f}")
+print(f"Skewness : {skew(residuals):.6f}")
+print(f"Kurtosis : {kurtosis(residuals, fisher=False):.6f}")
+
+print("\n--- Normality Tests ---")
+ks_stat, ks_p = kstest(residuals, 'norm')
+print(f"KS Test        : stat={ks_stat:.6f}, p={ks_p:.6f}")
+
+sw_stat, sw_p = shapiro(residuals)
+print(f"Shapiro-Wilk   : stat={sw_stat:.6f}, p={sw_p:.6f}")
+
+jb_stat, jb_p = jarque_bera(residuals)
+print(f"Jarque-Bera    : stat={jb_stat:.6f}, p={jb_p:.6f}")
+
+print("\n--- Autocorrelation ---")
+# Durbin-Watson
+diff = np.diff(residuals)
+DW = np.sum(diff**2) / np.sum(residuals**2)
+print(f"Durbin-Watson: {DW:.6f}")
+print("DW ≈ 2 means no autocorrelation. <2 → positive correlation, >2 → negative correlation.")
+
+
+
+## 441 output variable metrics 
+
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import StandardScaler
+
+# ===============================================================
+# DEVICE
+# ===============================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# ===============================================================
+# LOAD DATA (441 outputs)
+# ===============================================================
+project_dir = "/home/ved/projects"
+data = pd.read_csv(os.path.join(project_dir, "Data3.csv"))
+
+X = data[["X", "Y"]].values
+S_cols = [f"S{i}" for i in range(1, 442)]
+Y = data[S_cols].values   # shape (N, 441)
+
+# ===============================================================
+# NORMALIZATION
+# ===============================================================
+x_scaler = StandardScaler()
+X = x_scaler.fit_transform(X)
+
+y_scaler = StandardScaler()
+Y = y_scaler.fit_transform(Y)   # per-feature normalization
+
+# ===============================================================
+# TRAIN-TEST SPLIT
+# ===============================================================
+from sklearn.model_selection import train_test_split
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.1, random_state=42
+)
+
+# To tensors
+X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
+Y_train = torch.tensor(Y_train, dtype=torch.float32).to(device)
+X_test  = torch.tensor(X_test,  dtype=torch.float32).to(device)
+Y_test  = torch.tensor(Y_test,  dtype=torch.float32).to(device)
+
+# ===============================================================
+# MODEL: 1024-NEURON MLP WITH LAYERNORM + SILU
+# ===============================================================
+class StressMLP(nn.Module):
+    def __init__(self, in_dim=2, out_dim=441):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 1024),
+            nn.ReLU(),
+            nn.LayerNorm(1024),
+
+            nn.Linear(1024, 1024),
+            nn.SiLU(),
+            nn.LayerNorm(1024),
+
+            nn.Linear(1024, 1024),
+            nn.SiLU(),
+            nn.LayerNorm(1024),
+
+            nn.Linear(1024, 1024),
+            nn.SiLU(),
+            nn.LayerNorm(1024),
+
+            nn.Linear(1024, out_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+model = StressMLP().to(device)
+
+# ===============================================================
+# OPTIMIZER + SCHEDULER
+# ===============================================================
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=300, gamma=0.5)
+criterion_mse = nn.MSELoss()
+
+# ===============================================================
+# SAFE PEAK-WEIGHTED LOSS
+# ===============================================================
+def peak_loss(pred, true, alpha=1.2):
+    peak = torch.max(true, dim=1, keepdim=True)[0]
+    peak = peak.clamp(min=1e-6)
+
+    w = (true / peak).clamp(0.0, 1.0) ** alpha
+
+    return torch.mean(w * (pred - true)**2)
+
+# ===============================================================
+# TRAINING LOOP (STABLE)
+# ===============================================================
+epochs = 2000
+for epoch in range(epochs):
+
+    model.train()
+    optimizer.zero_grad()
+
+    pred = model(X_train)
+    pred = pred.clamp(-5.0, 5.0)      # prevent exploding activations
+
+    loss = criterion_mse(pred, Y_train) + 0.3 * peak_loss(pred, Y_train, alpha=1.2)
+
+    if torch.isnan(loss):
+        print("NaN detected! Stopping training.")
+        break
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # stability
+    optimizer.step()
+    scheduler.step()
+
+    if (epoch + 1) % 100 == 0:
+        model.eval()
+        with torch.no_grad():
+            vpred = model(X_test).clamp(-5.0, 5.0)
+            vloss = criterion_mse(vpred, Y_test).item()
+
+        print(f"Epoch {epoch+1}/{epochs} | TrainLoss={loss.item():.6f} | ValLoss={vloss:.6f}")
+
+# ===============================================================
+# VALIDATION ON 441 OUTPUTS
+# ===============================================================
+val_df = pd.read_csv(os.path.join(project_dir, "validation441stress.csv"))
+
+X_val = val_df[["X", "Y"]].values
+Y_val_true = val_df[[f"S{i}" for i in range(1, 442)]].values
+
+# Normalize inputs
+X_val_scaled = x_scaler.transform(X_val)
+X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32).to(device)
+
+# Predict
+model.eval()
+with torch.no_grad():
+    Y_val_pred_scaled = model(X_val_tensor).cpu().numpy()
+
+# Inverse-scale
+Y_val_pred = y_scaler.inverse_transform(Y_val_pred_scaled)
+
+# Errors
+abs_errors = np.abs(Y_val_pred - Y_val_true)
+mean_errors = np.mean(abs_errors, axis=1)
+max_errors  = np.max(abs_errors, axis=1)
+
+# Save results
+results = pd.DataFrame({
+    "X": X_val[:, 0],
+    "Y": X_val[:, 1],
+    "MeanError": mean_errors,
+    "MaxError": max_errors
+})
+print("\nValidation Results (441 outputs):")
+print(results)
+
+results_path = os.path.join(project_dir, "stress_validation_results_441.csv")
+results.to_csv(results_path, index=False)
+print(f"\nSaved validation results to {results_path}")
+
+# ===============================================================
+#          FULL METRICS: DETERMINISTIC + UQ + SV
+# ===============================================================
+import numpy as np
+from sklearn.metrics import r2_score
+from scipy.stats import skew, kurtosis, kstest, shapiro, jarque_bera
+
+print("\n=================================================")
+print("        COMPUTING FULL METRICS (441 STRESS)")
+print("=================================================")
+
+# ------------------------------------
+# Prepare flattened arrays
+# ------------------------------------
+y_true_flat = Y_val_true.flatten()
+y_pred_flat = Y_val_pred.flatten()
+errors = y_pred_flat - y_true_flat
+
+# ===============================================================
+# 1. DETERMINISTIC METRICS
+# ===============================================================
+MAE  = np.mean(np.abs(errors))
+RMSE = np.sqrt(np.mean(errors**2))
+Rel_L2 = np.linalg.norm(errors) / np.linalg.norm(y_true_flat)
+MaxErr = np.max(np.abs(errors))
+R2 = r2_score(y_true_flat, y_pred_flat)
+
+print("\n===== Deterministic Metrics (441 Stress) =====")
+print(f"MAE      : {MAE:.6f}")
+print(f"RMSE     : {RMSE:.6f}")
+print(f"Rel L2   : {Rel_L2:.6f}")
+print(f"Max Error: {MaxErr:.6f}")
+print(f"R2 Score : {R2:.6f}")
+
+# ===============================================================
+# 2. ENSEMBLE UQ (20 MODELS)
+# ===============================================================
+print("\n==============================")
+print("      Training Ensemble UQ")
+print("==============================")
+
+ensemble_preds = []
+
+for k in range(20):
+    print(f"> Model {k+1}/20")
+
+    # Create new model
+    emodel = StressMLP().to(device)
+    eopt   = torch.optim.Adam(emodel.parameters(), lr=1e-4)
+
+    # Short warmup training
+    for ep in range(150):
+        emodel.train()
+        eopt.zero_grad()
+
+        epred = emodel(X_train)
+        eloss = criterion_mse(epred, Y_train)
+        eloss.backward()
+        eopt.step()
+
+    emodel.eval()
+    with torch.no_grad():
+        epred_scaled = emodel(X_val_tensor).cpu().numpy()
+        epred_inv = y_scaler.inverse_transform(epred_scaled)
+        ensemble_preds.append(epred_inv)
+
+ensemble_preds = np.stack(ensemble_preds, axis=0)   # shape (20, N, 441)
+
+pred_mean = np.mean(ensemble_preds, axis=0)
+pred_std  = np.std(ensemble_preds, axis=0)
+
+# Mean predictive standard deviation
+UQ_mean_std = np.mean(pred_std)
+
+# Negative Log-Likelihood
+NLL = np.mean(
+    0.5 * np.log(pred_std**2 + 1e-8) +
+    (Y_val_true - pred_mean)**2 / (2*(pred_std**2 + 1e-8))
+)
+
+print("\n===== Ensemble UQ Metrics =====")
+print(f"Predictive Std (mean): {UQ_mean_std:.6f}")
+print(f"NLL: {NLL:.6f}")
+
+# ===============================================================
+# 3. STATISTICAL VALIDATION (SV)
+# ===============================================================
+residuals = errors   # already flattened
+
+print("\n==============================")
+print(" Statistical Validation (SV)")
+print("==============================")
+print(f"Total residual samples = {len(residuals)}")
+
+print("\n--- Residual Statistics ---")
+print(f"Mean     : {np.mean(residuals):.6f}")
+print(f"Std Dev  : {np.std(residuals):.6f}")
+print(f"Skewness : {skew(residuals):.6f}")
+print(f"Kurtosis : {kurtosis(residuals, fisher=False):.6f}")
+
+print("\n--- Normality Tests ---")
+ks_stat, ks_p = kstest(residuals, 'norm')
+print(f"KS Test        : stat={ks_stat:.6f}, p={ks_p:.6f}")
+
+sw_stat, sw_p = shapiro(residuals)
+print(f"Shapiro-Wilk   : stat={sw_stat:.6f}, p={sw_p:.6f}")
+
+jb_stat, jb_p = jarque_bera(residuals)
+print(f"Jarque-Bera    : stat={jb_stat:.6f}, p={jb_p:.6f}")
+
+print("\n--- Autocorrelation ---")
+diff = np.diff(residuals)
+DW = np.sum(diff**2) / np.sum(residuals**2)
+
+print(f"Durbin-Watson: {DW:.6f}")
+print("DW ≈ 2 means no autocorrelation. <2 → positive correlation, >2 → negative correlation.")
+
+# ===============================================================
+# SAVE EVERYTHING
+# ===============================================================
+full_metrics = {
+    "MAE": MAE,
+    "RMSE": RMSE,
+    "Rel_L2": Rel_L2,
+    "MaxError": MaxErr,
+    "R2": R2,
+    "UQ_mean_std": UQ_mean_std,
+    "NLL": NLL,
+    "Residual_Mean": np.mean(residuals),
+    "Residual_Std": np.std(residuals),
+    "Skewness": skew(residuals),
+    "Kurtosis": kurtosis(residuals, fisher=False),
+    "KS_p": ks_p,
+    "SW_p": sw_p,
+    "JB_p": jb_p,
+    "Durbin_Watson": DW
+}
+
+csv_path = os.path.join(project_dir, "stress_441_full_metrics.csv")
+pd.DataFrame([full_metrics]).to_csv(csv_path, index=False)
+print(f"\nSaved full metrics to {csv_path}")
+
+
+
