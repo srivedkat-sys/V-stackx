@@ -1175,3 +1175,74 @@ print("Output file:", OUTPUT_EXCEL)
 print("\nPreview:")
 print(df_out)
 
+
+
+## DoE
+
+import numpy as np
+import pandas as pd
+from scipy.stats import qmc
+
+def generate_clean_doe(n_samples=200):
+    # 7 continuous variables
+    sampler = qmc.LatinHypercube(d=7)
+    sample = sampler.random(n=n_samples)
+    
+    # Ranges
+    ranges = np.array([
+        [800, 1600],     # L [mm]
+        [150, 300],      # c [mm]
+        [0.08, 0.18],    # t/c
+        [0.15, 0.25],    # xf_ratio
+        [0.55, 0.75],    # xr_ratio
+        [1.5, 3.5],      # ts [mm]
+        [2.5, 5.5]       # tw [mm]
+    ])
+    
+    samples_scaled = qmc.scale(sample, ranges[:, 0], ranges[:, 1])
+    
+    df = pd.DataFrame(samples_scaled, 
+                      columns=['L', 'c', 't_c', 'xf_ratio', 'xr_ratio', 'ts', 'tw'])
+    
+    # Add discrete rib count
+    df['n_ribs'] = np.random.choice([0, 3, 5], n_samples, p=[0.3, 0.4, 0.3])
+    
+    # Add material/load with reasonable variation
+    df['E'] = np.random.choice([68000, 69000, 70000, 71000, 72000], n_samples)
+    df['p'] = np.round(np.random.uniform(0.002, 0.010, n_samples), 4)
+    
+    # Compute spar positions
+    df['xf'] = np.round(df['xf_ratio'] * df['c'], 1)
+    df['xr'] = np.round(df['xr_ratio'] * df['c'], 1)
+    
+    # Round to practical values
+    df['L'] = df['L'].round(0).astype(int)      # nearest mm
+    df['c'] = df['c'].round(0).astype(int)      # nearest mm
+    df['t_c'] = df['t_c'].round(3)              # 3 decimal places
+    df['ts'] = df['ts'].round(1)                # 0.1 mm precision
+    df['tw'] = df['tw'].round(1)                # 0.1 mm precision
+    df['xf'] = df['xf'].round(0).astype(int)    # nearest mm
+    df['xr'] = df['xr'].round(0).astype(int)    # nearest mm
+    
+    # Drop ratio columns
+    df = df.drop(['xf_ratio', 'xr_ratio'], axis=1)
+    
+    # Add constant
+    df['nu'] = 0.3
+    
+    # Ensure xf < xr
+    df['xf'] = np.minimum(df['xf'], df['xr'] - 10)  # at least 10mm gap
+    
+    # Reorder columns
+    df = df[['L', 'c', 't_c', 'xf', 'xr', 'ts', 'tw', 'n_ribs', 'E', 'p', 'nu']]
+    
+    return df
+
+# Generate and check
+design_df = generate_clean_doe(200)
+print("First 5 designs (clean, practical values):")
+print(design_df.head().to_string(index=False))
+print(f"\nTotal designs: {len(design_df)}")
+
+# Save
+design_df.to_csv('wing_doe_clean.csv', index=False)
