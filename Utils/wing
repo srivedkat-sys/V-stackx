@@ -1,1 +1,130 @@
+## Data extractor for Ansys nodal solution
+
+import pandas as pd
+import numpy as np
+from scipy.interpolate import griddata
+from scipy.spatial.distance import cdist
+
+# ==========================================================
+# USER INPUTS ───────────────────────────────────────────────
+# ==========================================================
+TOP_STRESS_FILE    = ""          # top surface normal stress
+BOTTOM_STRESS_FILE = ""       # bottom surface normal stress
+TOP_DISP_FILE      = ""             # top surface displacement file (u_y)
+
+TOTAL_SPAN   =           # total wing span L [mm]
+FRONT_SPAR_X =           # front spar X [mm]
+REAR_SPAR_X  =           # rear spar X [mm]
+TOTAL_CHORD  =           # total chord length c [mm]
+
+MID_CHORD_X = TOTAL_CHORD / 2.0
+
+# Evaluation stations
+percentages = [10, 25, 50, 75, 100]
+z_locations = [TOTAL_SPAN * (p / 100.0) for p in percentages]
+
+# Output CSV file
+OUTPUT_CSV = "wing_spar_results.csv"
+
+# ==========================================================
+# LOAD FUNCTION
+# ==========================================================
+def load_data(filepath, name="data"):
+    print(f"Loading {name}...")
+    df = pd.read_csv(filepath, sep=r"\s+", engine="python")
+    if len(df.columns) >= 4:
+        df = df.iloc[:, :4]
+        df.columns = ["X", "Y", "Z", "Value"]  # Value = Stress or Disp
+    else:
+        raise ValueError(f"File {filepath} has fewer than 4 columns.")
+    
+    for col in ["X", "Y", "Z", "Value"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna().reset_index(drop=True)
+    
+    print(f"  {len(df)} points | X: {df['X'].min():.1f}–{df['X'].max():.1f} | Z: {df['Z'].min():.1f}–{df['Z'].max():.1f}")
+    return df
+
+# ==========================================================
+# INTERPOLATION – always returns Python float
+# ==========================================================
+def interpolate_value(df, x_target, z_target):
+    points = df[["X", "Z"]].values
+    values = df["Value"].values
+
+    # Try linear first
+    try:
+        val = griddata(points, values, (x_target, z_target), method="linear")
+        if np.isnan(val):
+            raise ValueError("NaN from linear")
+        return float(val), "linear", 0.0
+    except:
+        pass
+
+    # nearest fallback
+    distances = cdist([[x_target, z_target]], points)[0]
+    idx = np.argmin(distances)
+    val = float(values[idx])
+    dist = float(distances[idx])
+    print(f"  Warning: Linear failed at X={x_target:.1f}, Z={z_target:.1f} → nearest ({dist:.2f} mm)")
+    return val, "nearest", dist
+
+# ==========================================================
+# MAIN COMPUTATION
+# ==========================================================
+if __name__ == "__main__":
+    print("="*70)
+    print("Wing Spar Stress & Mid-Chord Displacement Extractor")
+    print(f"Span = {TOTAL_SPAN:.1f} mm | Chord = {TOTAL_CHORD:.1f} mm | Mid-chord X = {MID_CHORD_X:.1f} mm")
+    print("="*70 + "\n")
+
+    # Load datasets
+    df_top_stress    = load_data(TOP_STRESS_FILE,    "Top stress")
+    df_bottom_stress = load_data(BOTTOM_STRESS_FILE, "Bottom stress")
+    df_top_disp      = load_data(TOP_DISP_FILE,      "Top displacement")
+
+    # Prepare result list
+    results = []
+
+    print("\n" + "═"*80)
+    print(f"{'y (mm)':>10} | {'FT':>10} | {'RT':>10} | {'FB':>10} | {'RB':>10} | {'D (mm)':>10}")
+    print("─"*80)
+
+    for pct, z in zip(percentages, z_locations):
+        # Stresses - top
+        ft, _, _ = interpolate_value(df_top_stress,    FRONT_SPAR_X, z)
+        rt, _, _ = interpolate_value(df_top_stress,    REAR_SPAR_X,  z)
+
+        # Stresses - bottom
+        fb, _, _ = interpolate_value(df_bottom_stress, FRONT_SPAR_X, z)
+        rb, _, _ = interpolate_value(df_bottom_stress, REAR_SPAR_X,  z)
+
+        # Displacement at mid-chord (from top surface data)
+        d, method_d, dist_d = interpolate_value(df_top_disp, MID_CHORD_X, z)
+        d_str = f"{d:10.3f}"
+        if method_d == "nearest":
+            d_str += f" (nearest, {dist_d:.2f} mm)"
+
+        # Print row
+        print(f"{z:10.1f} | {ft:10.2f} | {rt:10.2f} | {fb:10.2f} | {rb:10.2f} | {d_str}")
+
+        # Store for CSV
+        results.append({
+            "y": round(z, 1),
+            "FT": round(ft, 2),
+            "RT": round(rt, 2),
+            "FB": round(fb, 2),
+            "RB": round(rb, 2),
+            "D":  round(d, 3)
+        })
+
+    print("═"*80)
+    print("Note: FT/RT = top surface, FB/RB = bottom surface, D = vertical disp at mid-chord (top data)\n")
+
+    # Save to CSV
+    df_results = pd.DataFrame(results)
+    df_results.to_csv(OUTPUT_CSV, index=False, float_format="%.3f")
+    print(f"Results saved to: {OUTPUT_CSV}")
+    print(df_results.to_string(index=False))
+
 
