@@ -1,1 +1,874 @@
+## Validation and metrics & Inferernce script
+
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.rcParams.update({
+    'font.size': 10, 'axes.titlesize': 10,
+    'axes.labelsize': 9, 'xtick.labelsize': 8,
+    'ytick.labelsize': 8, 'legend.fontsize': 8,
+    'figure.dpi': 150, 'savefig.dpi': 300,
+    'savefig.bbox': 'tight',
+})
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+import sklearn.preprocessing._data
+torch.serialization.add_safe_globals([sklearn.preprocessing._data.StandardScaler])
+
+# =============================================================
+# PATHS — SPARSE DATA VERSION
+# =============================================================
+CSV        = "/home/ved/wing/Wingdata2.csv"
+MODEL_PATH = "best_split_pinn_FINAL.pth"
+OUT_DIR    = "./"
+
+INPUT_COLS  = ['L','c','t_c','xf','xr','ts','tw','n_ribs','E','p','y']
+TARGET_COL  = ['D']
+CONFIG_COLS = ['L','c','t_c','xf','xr','ts','tw','n_ribs','E','p']
+INPUT_DIM   = 11
+IDX_Y       = 10
+
+SKIP_THRESHOLD = 0.5   # mm — skip near-root rows for % error
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+# =============================================================
+# 1. STRUCTURAL FUNCTIONS
+# =============================================================
+
+def naca_thickness(x, c, t_c):
+    x_c = x / c
+    a0,a1,a2,a3,a4 = 0.2969,-0.1260,-0.3516,0.2843,-0.1015
+    return (t_c/0.2)*(a0*np.sqrt(x_c)+a1*x_c+a2*x_c**2+
+                      a3*x_c**3+a4*x_c**4)*c
+
+def compute_I_numeric(c, t_c, ts, tw, xf, xr):
+    n=200; x=np.linspace(0,c,n)
+    yt=naca_thickness(x,c,t_c)
+    dyt_dx=np.gradient(yt,x)
+    ds=np.sqrt(1+dyt_dx**2); dx=c/(n-1)
+    I_skin=2*ts*np.sum(yt**2*ds)*dx
+    I_spar_f=tw*(2*naca_thickness(xf,c,t_c))**3/12
+    I_spar_r=tw*(2*naca_thickness(xr,c,t_c))**3/12
+    return I_skin+I_spar_f+I_spar_r
+
+def delta_at(y, w, L, EI):
+    """Analytical deflection: v(y) = (w/24EI)(6L²y²-4Ly³+y⁴)"""
+    return (w/(24*EI))*(6*L**2*y**2 - 4*L*y**3 + y**4)
+
+def moment_at(y, w, L):
+    """Analytical bending moment: M(y) = (w/2)(L-y)²"""
+    return (w/2)*(L-y)**2
+
+def get_EI_w(row):
+    I  = compute_I_numeric(float(row['c']),  float(row['t_c']),
+                           float(row['ts']), float(row['tw']),
+                           float(row['xf']), float(row['xr']))
+    EI = float(row['E']) * I
+    w  = float(row['p']) * float(row['c'])
+    return EI, w, I
+
+
+# =============================================================
+# 2. MODEL DEFINITIONS (must match training exactly)
+# =============================================================
+
+class ConfigEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(10, 32), nn.Tanh(),
+            nn.Linear(32, 16), nn.Tanh(),
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, config):
+        return torch.exp(self.net(config) + 10.0)
+
+
+class SplitPINN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.freqs = torch.arange(1, 11).float()
+        self.net = nn.Sequential(
+            nn.Linear(11 + 20, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, 2)
+        )
+
+    def fourier(self, x):
+        y = x[:, IDX_Y:IDX_Y+1]
+        f = self.freqs.to(x.device)
+        return torch.cat([
+            torch.sin(2*np.pi*f*y/250.0),
+            torch.cos(2*np.pi*f*y/250.0)
+        ], dim=1)
+
+    def forward(self, x):
+        x = torch.cat([x, self.fourier(x)], dim=1)
+        out = self.net(x)
+        return out[:,0:1], out[:,1:2]
+
+
+# =============================================================
+# 3. SURROGATE WRAPPER
+# =============================================================
+
+class SplitPINNSurrogate:
+    def __init__(self, path=MODEL_PATH):
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        
+        self.model = SplitPINN().to(device)
+        self.model.load_state_dict(ckpt['model'])
+        self.model.eval()
+        
+        self.ei_encoder = ConfigEncoder().to(device)
+        self.ei_encoder.load_state_dict(ckpt['ei_encoder'])
+        self.ei_encoder.eval()
+        
+        self.in_scaler  = ckpt['in_scaler']
+        self.out_scaler = ckpt['out_scaler']
+        
+        print(f"✓ SplitPINN (ConfigEncoder) loaded from {path}")
+
+    def predict(self, L, c, t_c, xf, xr, ts, tw, n_ribs, E, p, y):
+        """Returns (deflection_mm, moment_normalised)"""
+        X  = np.array([[L,c,t_c,xf,xr,ts,tw,n_ribs,E,p,y]],
+                      dtype=np.float32)
+        Xs = self.in_scaler.transform(X)
+        Xt = torch.tensor(Xs, device=device, dtype=torch.float32)
+        
+        with torch.no_grad():
+            v_sc, M_sc = self.model(Xt)
+        
+        v = float(v_sc.cpu().numpy()) * self.out_scaler.scale_[0] \
+            + self.out_scaler.mean_[0]
+        M = float(M_sc.cpu().numpy())
+        return v, M
+
+    def predict_v(self, L, c, t_c, xf, xr, ts, tw, n_ribs, E, p, y):
+        v, _ = self.predict(L,c,t_c,xf,xr,ts,tw,n_ribs,E,p,y)
+        return v
+
+    def predict_span(self, cfg, n_points=200):
+        y_vals = np.linspace(0, cfg['L'], n_points)
+        vs, Ms = [], []
+        for y in y_vals:
+            v, M = self.predict(cfg['L'], cfg['c'], cfg['t_c'],
+                                cfg['xf'], cfg['xr'], cfg['ts'],
+                                cfg['tw'], int(cfg['n_ribs']),
+                                cfg['E'],  cfg['p'], y)
+            vs.append(v); Ms.append(M)
+        return y_vals, np.array(vs), np.array(Ms)
+
+    def predict_EI(self, L, c, t_c, xf, xr, ts, tw, n_ribs, E, p):
+        """Predict EI from geometry using ConfigEncoder"""
+        X = np.array([[L,c,t_c,xf,xr,ts,tw,n_ribs,E,p]], dtype=np.float32)
+        Xs = self.in_scaler.transform(X)[:, :10]  # First 10 columns are config
+        Xt = torch.tensor(Xs, device=device, dtype=torch.float32)
+        with torch.no_grad():
+            EI = self.ei_encoder(Xt)
+        return float(EI.cpu().numpy())
+
+
+# =============================================================
+# 4. SPARSE DATA VALIDATION — Check training points
+# =============================================================
+
+def sparse_data_validation(df, surrogate):
+    """Verify predictions at the exact 3 training points per wing"""
+    print("\n" + "=" * 57)
+    print("  SPARSE DATA VALIDATION — Training Points (Root, Mid, Tip)")
+    print("=" * 57)
+    
+    unique_cfgs = df[CONFIG_COLS].drop_duplicates().reset_index(drop=True)
+    
+    all_errors = {'root': [], 'mid': [], 'tip': []}
+    
+    for _, cfg in unique_cfgs.iterrows():
+        L_c = float(cfg['L'])
+        
+        # Get training data for this config
+        cfg_rows = df[
+            (df['L'] == cfg['L']) & (df['c'] == cfg['c']) &
+            (df['t_c'] == cfg['t_c']) & (df['xf'] == cfg['xf']) &
+            (df['xr'] == cfg['xr']) & (df['ts'] == cfg['ts']) &
+            (df['tw'] == cfg['tw']) & (df['n_ribs'] == cfg['n_ribs']) &
+            (df['E'] == cfg['E']) & (df['p'] == cfg['p'])
+        ].sort_values('y')
+        
+        for _, row in cfg_rows.iterrows():
+            y_pos = row['y']
+            d_true = row['D']
+            d_pred = surrogate.predict_v(
+                L_c, float(cfg['c']), float(cfg['t_c']),
+                float(cfg['xf']), float(cfg['xr']),
+                float(cfg['ts']), float(cfg['tw']),
+                int(cfg['n_ribs']), float(cfg['E']),
+                float(cfg['p']), y_pos)
+            
+            err = abs(d_pred - d_true)
+            
+            if y_pos == 0:
+                all_errors['root'].append(err)
+            elif abs(y_pos - L_c/2) < L_c/4:  # Mid-span
+                all_errors['mid'].append(err)
+            else:
+                all_errors['tip'].append(err)
+    
+    print(f"\n  Root (y=0) — Training data: D=0 (explicit BC)")
+    print(f"    Mean error: {np.mean(all_errors['root']):.4f} mm")
+    print(f"    Max error:  {np.max(all_errors['root']):.4f} mm")
+    
+    print(f"\n  Mid-span (y=L/2) — Training data anchor")
+    print(f"    Mean error: {np.mean(all_errors['mid']):.4f} mm")
+    print(f"    Max error:  {np.max(all_errors['mid']):.4f} mm")
+    
+    print(f"\n  Tip (y=L) — Training data anchor")
+    print(f"    Mean error: {np.mean(all_errors['tip']):.4f} mm")
+    print(f"    Max error:  {np.max(all_errors['tip']):.4f} mm")
+    
+    return all_errors
+
+
+# =============================================================
+# 5. FULL DATASET VALIDATION (All span locations)
+# =============================================================
+
+def full_dataset_validation(df, surrogate):
+    print(f"\n{'─'*57}")
+    print("  FULL DATASET VALIDATION — All Span Locations")
+    print(f"{'─'*57}")
+
+    records = []
+    skipped = 0
+
+    for _, row in df.iterrows():
+        EI_r, w_r, _ = get_EI_w(row)
+        L_r = float(row['L']); y_r = float(row['y'])
+        d_an = delta_at(y_r, w_r, L_r, EI_r)
+        if d_an < SKIP_THRESHOLD:
+            skipped += 1; continue
+
+        d_act = float(row['D'])
+        d_pinn = surrogate.predict_v(
+            float(row['L']), float(row['c']), float(row['t_c']),
+            float(row['xf']), float(row['xr']), float(row['ts']),
+            float(row['tw']), int(row['n_ribs']),
+            float(row['E']),  float(row['p']), y_r)
+
+        denom = max(abs(d_act), SKIP_THRESHOLD)
+        records.append({
+            'frac':    y_r/L_r,
+            'D':       d_act,
+            'D_an':    d_an,
+            'D_pinn':  d_pinn,
+            'err_pct': abs(d_pinn-d_act)/denom*100,
+            'err_abs': abs(d_pinn-d_act),
+            'c':       float(row['c']),
+            'p':       float(row['p']),
+        })
+
+    errs     = np.array([r['err_pct'] for r in records])
+    abs_errs = np.array([r['err_abs'] for r in records])
+    act_arr  = np.array([r['D']       for r in records])
+    pred_arr = np.array([r['D_pinn']  for r in records])
+
+    ss_res = np.sum((act_arr-pred_arr)**2)
+    ss_tot = np.sum((act_arr-act_arr.mean())**2)
+    r2     = 1 - ss_res/(ss_tot+1e-12)
+    rmse   = np.sqrt(np.mean((act_arr-pred_arr)**2))
+    mae    = np.mean(np.abs(act_arr-pred_arr))
+    maxae  = np.max(np.abs(act_arr-pred_arr))
+    nrmse  = rmse/(act_arr.max()-act_arr.min())*100
+
+    print(f"\n  Rows validated : {len(records)}")
+    print(f"  Rows skipped   : {skipped}  (< {SKIP_THRESHOLD}mm)")
+    print(f"\n  ┌─────────────────────────────────────────┐")
+    print(f"  │  SPLIT PINN (ConfigEncoder) — METRICS   │")
+    print(f"  ├─────────────────────────────────────────┤")
+    print(f"  │  R²                    : {r2:>8.4f}          │")
+    print(f"  │  RMSE (mm)             : {rmse:>8.4f}          │")
+    print(f"  │  NRMSE (%)             : {nrmse:>8.4f}          │")
+    print(f"  │  MAE (mm)              : {mae:>8.4f}          │")
+    print(f"  │  Max AE (mm)           : {maxae:>8.4f}          │")
+    print(f"  │  Mean rel error        : {errs.mean():>7.2f}%          │")
+    print(f"  │  Median rel error      : {np.median(errs):>7.2f}%          │")
+    print(f"  │  Max rel error         : {errs.max():>7.2f}%          │")
+    print(f"  │  Rows within 5%        : {(errs<5).sum()/len(errs)*100:>7.1f}%          │")
+    print(f"  │  Rows within 10%       : {(errs<10).sum()/len(errs)*100:>7.1f}%          │")
+    print(f"  └─────────────────────────────────────────┘")
+
+    print(f"\n  Breakdown by span location:")
+    print(f"  {'Location':<12} {'Mean%':>7} {'Median%':>8} "
+          f"{'Max%':>7} {'MaxAbs':>8}  n")
+    print(f"  {'─'*52}")
+    frac_groups = {}
+    for frac, lbl in [(0.10,'10%'),(0.25,'25%'),(0.50,'50%'),
+                      (0.75,'75%'),(1.00,'Tip')]:
+        grp = [r for r in records if abs(r['frac']-frac) < 0.05]
+        if grp:
+            gp = np.array([r['err_pct'] for r in grp])
+            ga = np.array([r['err_abs'] for r in grp])
+            frac_groups[lbl] = {'pct': gp, 'abs': ga}
+            print(f"  {lbl:<12} {gp.mean():>7.2f}% "
+                  f"{np.median(gp):>7.2f}% "
+                  f"{gp.max():>7.2f}% {ga.max():>7.3f}mm  {len(grp)}")
+
+    return records, r2, rmse, nrmse, mae, maxae, errs, act_arr, pred_arr, frac_groups
+
+
+# =============================================================
+# 6. EXTRAPOLATION ANALYSIS
+# =============================================================
+
+def extrapolation_analysis(df, surrogate):
+    print(f"\n{'─'*57}")
+    print("  EXTRAPOLATION ANALYSIS")
+    print(f"{'─'*57}")
+
+    med = df[CONFIG_COLS].drop_duplicates().median()
+    base = {col: float(med[col]) for col in CONFIG_COLS}
+    L_max = df['L'].max()
+
+    print(f"  Base config: L={base['L']:.0f}mm  c={base['c']:.0f}mm  "
+          f"p={base['p']:.4f}MPa")
+    print(f"  Training L range: {df['L'].min():.0f}–{L_max:.0f}mm")
+    print(f"\n  {'L(mm)':>8} {'Overshoot':>10} {'D_analy':>9} "
+          f"{'D_PINN':>9} {'Err%':>8}")
+    print(f"  {'─'*50}")
+
+    fracs   = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+    extrap_errs = []
+    extrap_Ls   = []
+
+    for frac in fracs:
+        L_t = L_max * (1 + frac)
+        I_t = compute_I_numeric(base['c'],  base['t_c'],
+                                base['ts'], base['tw'],
+                                base['xf'], base['xr'])
+        w_t  = base['p'] * base['c']
+        EI_t = base['E'] * I_t
+        d_an = (w_t * L_t**4) / (8.0 * EI_t)
+        d_pinn = surrogate.predict_v(
+            L_t, base['c'], base['t_c'], base['xf'], base['xr'],
+            base['ts'], base['tw'], int(base['n_ribs']),
+            base['E'], base['p'], L_t)
+        err = abs(d_pinn-d_an)/(d_an+1e-10)*100
+        extrap_errs.append(err)
+        extrap_Ls.append(L_t)
+        region = 'interpolation' if frac==0 else f'+{frac*100:.0f}%'
+        print(f"  {L_t:>8.0f} {frac*100:>9.0f}% {d_an:>9.2f} "
+              f"{d_pinn:>9.2f} {err:>7.2f}%  {region}")
+
+    interp_err  = extrap_errs[0]
+    mild_errs   = [extrap_errs[i] for i in [1,2,3]]
+    aggr_errs   = [extrap_errs[i] for i in [4,5,6]]
+    EDF_mild    = np.mean(mild_errs)  / (interp_err+1e-10)
+    EDF_aggr    = np.mean(aggr_errs)  / (interp_err+1e-10)
+
+    print(f"\n  EDF (mild  +5–15%): {EDF_mild:.1f}×")
+    print(f"  EDF (aggr +20–30%): {EDF_aggr:.1f}×")
+
+    return fracs, extrap_errs, extrap_Ls
+
+
+# =============================================================
+# 7. FIGURES
+# =============================================================
+
+def generate_figures(df, surrogate, records, r2, rmse, nrmse,
+                     act_arr, pred_arr, frac_groups,
+                     fracs, extrap_errs, extrap_Ls, sparse_errors):
+
+    print(f"\n{'─'*57}")
+    print("  Generating figures...")
+    print(f"{'─'*57}")
+
+    unique_cfgs = df[CONFIG_COLS].drop_duplicates().reset_index(drop=True)
+    n_cfg = len(unique_cfgs)
+    sample_idxs = [0, n_cfg//2, n_cfg-1]
+
+    # ── FIG 1 — Spanwise comparison 3 configs (with data points)
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.8))
+    fig.suptitle('PINN (ConfigEncoder) vs Analytical — Spanwise Deflection\n'
+                 '● = Training data points (root, mid, tip)', fontsize=9)
+
+    for ax, idx in zip(axes, sample_idxs):
+        cfg  = unique_cfgs.iloc[idx]
+        L_c  = float(cfg['L']); c_c = float(cfg['c'])
+        p_c  = float(cfg['p'])
+        EI_c, w_c, _ = get_EI_w(cfg)
+
+        # Get training data points for this config
+        cfg_rows = df[
+            (df['L'] == cfg['L']) & (df['c'] == cfg['c']) &
+            (df['t_c'] == cfg['t_c']) & (df['xf'] == cfg['xf']) &
+            (df['xr'] == cfg['xr']) & (df['ts'] == cfg['ts']) &
+            (df['tw'] == cfg['tw']) & (df['n_ribs'] == cfg['n_ribs']) &
+            (df['E'] == cfg['E']) & (df['p'] == cfg['p'])
+        ]
+
+        y_v  = np.linspace(0, L_c, 200)
+        d_an = np.array([delta_at(yy,w_c,L_c,EI_c) for yy in y_v])
+        d_pi = np.array([surrogate.predict_v(
+            L_c,c_c,float(cfg['t_c']),float(cfg['xf']),
+            float(cfg['xr']),float(cfg['ts']),float(cfg['tw']),
+            int(cfg['n_ribs']),float(cfg['E']),p_c,yy)
+            for yy in y_v])
+
+        tip_err = abs(d_pi[-1]-d_an[-1])/(d_an[-1]+1e-10)*100
+
+        ax.plot(y_v, d_an, 'k-',  lw=2,   label='Analytical')
+        ax.plot(y_v, d_pi, 'b--', lw=1.5, label=f'PINN ({tip_err:.1f}%)')
+        ax.scatter(cfg_rows['y'], cfg_rows['D'], c='red', s=40, zorder=5,
+                   marker='o', label='Training data')
+        ax.axhline(0, color='gray', lw=0.5)
+        ax.set_xlabel('Span y (mm)'); ax.set_ylabel('Deflection v (mm)')
+        ax.set_title(f'c={c_c:.0f}mm  p={p_c:.4f}MPa\n'
+                     f'δ_tip={d_an[-1]:.1f}mm')
+        ax.legend(fontsize=6); ax.grid(True, alpha=0.2)
+
+    plt.tight_layout()
+    plt.savefig(OUT_DIR + 'split_sparse_fig1_spanwise.png')
+    plt.close()
+    print("  ✓ split_sparse_fig1_spanwise.png")
+
+    # ── FIG 2 — Scatter predicted vs actual
+    fig, ax = plt.subplots(figsize=(5, 5))
+    sc = ax.scatter(act_arr, pred_arr, c=act_arr, cmap='viridis',
+                    s=12, alpha=0.6, zorder=3)
+    plt.colorbar(sc, ax=ax, label='Actual deflection (mm)', shrink=0.85)
+    lim = [act_arr.min()-3, act_arr.max()+3]
+    ax.plot(lim, lim, 'r--', lw=1.5, label='Perfect prediction')
+    ax.fill_between(lim, [l-rmse for l in lim], [l+rmse for l in lim],
+                    alpha=0.08, color='red', label=f'±RMSE ({rmse:.2f}mm)')
+    ax.set_xlim(lim); ax.set_ylim(lim)
+    ax.set_xlabel('Actual Deflection (mm)')
+    ax.set_ylabel('PINN Predicted (mm)')
+    ax.set_title(f'PINN (ConfigEncoder) — Predicted vs Actual\n'
+                 f'R²={r2:.4f}  RMSE={rmse:.2f}mm')
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.25); ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.savefig(OUT_DIR + 'split_sparse_fig2_scatter.png')
+    plt.close()
+    print("  ✓ split_sparse_fig2_scatter.png")
+
+    # ── FIG 3 — Error by span location
+    labels  = list(frac_groups.keys())
+    pct_grps= [frac_groups[l]['pct'] for l in labels]
+    abs_grps= [frac_groups[l]['abs'] for l in labels]
+
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))
+
+    bp = axes[0].boxplot(pct_grps, tick_labels=labels, patch_artist=True,
+                         medianprops=dict(color='crimson', lw=2))
+    colors = ['#d4e6f1','#a9cce3','#7fb3d3','#5499c7','#2980b9']
+    for patch, col in zip(bp['boxes'], colors):
+        patch.set_facecolor(col); patch.set_alpha(0.8)
+    axes[0].set_xlabel('Span Location')
+    axes[0].set_ylabel('Relative Error (%)')
+    axes[0].set_title('(a) Relative Error by Span Location')
+    axes[0].grid(True, alpha=0.25, axis='y'); axes[0].set_ylim(bottom=0)
+
+    bp2 = axes[1].boxplot(abs_grps, tick_labels=labels, patch_artist=True,
+                          medianprops=dict(color='crimson', lw=2))
+    for patch, col in zip(bp2['boxes'], colors):
+        patch.set_facecolor(col); patch.set_alpha(0.8)
+    axes[1].set_xlabel('Span Location')
+    axes[1].set_ylabel('Absolute Error (mm)')
+    axes[1].set_title('(b) Absolute Error by Span Location')
+    axes[1].grid(True, alpha=0.25, axis='y'); axes[1].set_ylim(bottom=0)
+
+    plt.tight_layout()
+    plt.savefig(OUT_DIR + 'split_sparse_fig3_error_by_span.png')
+    plt.close()
+    print("  ✓ split_sparse_fig3_error_by_span.png")
+
+    # ── FIG 4 — Near-root zoom (critical for sparse data)
+    cfg  = unique_cfgs.iloc[0]
+    L_c  = float(cfg['L']); c_c = float(cfg['c']); p_c = float(cfg['p'])
+    EI_c, w_c, _ = get_EI_w(cfg)
+    y_zoom = np.linspace(0, 0.20*L_c, 150)
+
+    d_an_z = np.array([delta_at(yy,w_c,L_c,EI_c) for yy in y_zoom])
+    d_pi_z = np.array([surrogate.predict_v(
+        L_c,c_c,float(cfg['t_c']),float(cfg['xf']),float(cfg['xr']),
+        float(cfg['ts']),float(cfg['tw']),int(cfg['n_ribs']),
+        float(cfg['E']),p_c,yy) for yy in y_zoom])
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(y_zoom, d_an_z, 'k-',  lw=2.5, label='Analytical (v≥0)',  zorder=4)
+    ax.plot(y_zoom, d_pi_z, 'b--', lw=2,   label='SplitPINN',         zorder=3)
+    ax.axhline(0, color='gray', lw=1.2, alpha=0.7,
+               label='v=0 (physical limit)')
+    
+    # Mark the explicit training point at root
+    ax.scatter([0], [0], c='red', s=80, zorder=6, marker='o',
+               label='Training data: D=0 (explicit BC)')
+    
+    ax.fill_between(y_zoom, np.minimum(d_pi_z, 0), 0,
+                    alpha=0.15, color='blue', label='Physically impossible region')
+    ax.set_xlabel('Span y (mm)')
+    ax.set_ylabel('Deflection v (mm)')
+    ax.set_title(f'Near-Root Region — BC Verification\n'
+                 f'v(0)=0 enforced by explicit training data\n'
+                 f'c={c_c:.0f}mm, p={p_c:.4f}MPa')
+    ax.legend(fontsize=7); ax.grid(True, alpha=0.25)
+    
+    plt.tight_layout()
+    plt.savefig(OUT_DIR + 'split_sparse_fig4_root_zoom.png')
+    plt.close()
+    print("  ✓ split_sparse_fig4_root_zoom.png")
+
+    # ── FIG 5 — Extrapolation
+    ep_pct = [f*100 for f in fracs]
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.8))
+
+    axes[0].plot(ep_pct, extrap_errs, 'b-o', lw=1.8, ms=6)
+    axes[0].axvline(0, color='gray', ls='--', lw=1,
+                    label='Training boundary')
+    axes[0].axhspan(0,  5, alpha=0.07, color='green')
+    axes[0].axhspan(5, 10, alpha=0.07, color='orange')
+    axes[0].axhspan(10, max(extrap_errs)*1.2, alpha=0.07, color='red')
+    axes[0].set_xlabel('Extrapolation beyond training range (%)')
+    axes[0].set_ylabel('Relative Error (%)')
+    axes[0].set_title('(a) Prediction Error vs Extrapolation\n'
+                      f'(L beyond L_max = {df["L"].max():.0f}mm)')
+    axes[0].legend(); axes[0].grid(True, alpha=0.25)
+    axes[0].set_xlim(-1, 31); axes[0].set_ylim(bottom=0)
+
+    L_max = df['L'].max()
+    med   = df[CONFIG_COLS].drop_duplicates().median()
+    base  = {col: float(med[col]) for col in CONFIG_COLS}
+    d_analy_extrap = []
+    d_pinn_extrap  = []
+    for frac, L_t in zip(fracs, extrap_Ls):
+        I_t  = compute_I_numeric(base['c'],  base['t_c'],
+                                 base['ts'], base['tw'],
+                                 base['xf'], base['xr'])
+        w_t  = base['p']*base['c']
+        EI_t = base['E']*I_t
+        d_analy_extrap.append((w_t*L_t**4)/(8*EI_t))
+        d_pinn_extrap.append(surrogate.predict_v(
+            L_t,base['c'],base['t_c'],base['xf'],base['xr'],
+            base['ts'],base['tw'],int(base['n_ribs']),
+            base['E'],base['p'],L_t))
+
+    axes[1].plot(ep_pct, d_analy_extrap, 'k-o',  lw=1.8, ms=5,
+                 label='Analytical')
+    axes[1].plot(ep_pct, d_pinn_extrap,  'b--s', lw=1.8, ms=5,
+                 label='PINN')
+    axes[1].axvline(0, color='gray', ls='--', lw=1,
+                    label='Training boundary')
+    axes[1].set_xlabel('Extrapolation beyond training range (%)')
+    axes[1].set_ylabel('Tip Deflection (mm)')
+    axes[1].set_title('(b) Tip Deflection-PINN vs Analytical')
+    axes[1].legend(); axes[1].grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    plt.savefig(OUT_DIR + 'split_sparse_fig5_extrapolation.png')
+    plt.close()
+    print("  ✓ split_sparse_fig5_extrapolation.png")
+
+    # ── FIG 6 — Moment field M(y)
+    cfg  = unique_cfgs.iloc[0]
+    L_c  = float(cfg['L']); c_c = float(cfg['c']); p_c = float(cfg['p'])
+    EI_c, w_c, _ = get_EI_w(cfg)
+
+    y_v  = np.linspace(0, L_c, 200)
+    M_an = np.array([moment_at(yy,w_c,L_c) for yy in y_v])
+
+    results = [surrogate.predict(
+        L_c,c_c,float(cfg['t_c']),float(cfg['xf']),float(cfg['xr']),
+        float(cfg['ts']),float(cfg['tw']),int(cfg['n_ribs']),
+        float(cfg['E']),p_c,yy) for yy in y_v]
+    M_pi = np.array([r[1] for r in results])
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(y_v, M_an/1e6, 'k-',  lw=2,   label='Analytical M (kN·m)')
+    ax.plot(y_v, M_pi,     'g--', lw=1.5,
+            label='PINN M (normalised output)')
+    ax.set_xlabel('Span y (mm)')
+    ax.set_ylabel('Bending Moment')
+    ax.set_title('Moment Field — unique to PINN\n'
+                 '(PINN M is in normalised output space)')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(OUT_DIR + 'split_sparse_fig6_moment_field.png')
+    plt.close()
+    print("  ✓ split_sparse_fig6_moment_field.png")
+    
+    # ── FIG 7 — Collocation check (physics filling gaps)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    # Pick a config with clear gap between sparse points
+    cfg = unique_cfgs.iloc[0]
+    L_c = float(cfg['L']); c_c = float(cfg['c']); p_c = float(cfg['p'])
+    EI_c, w_c, _ = get_EI_w(cfg)
+    
+    y_v = np.linspace(0, L_c, 200)
+    d_an = np.array([delta_at(yy,w_c,L_c,EI_c) for yy in y_v])
+    d_pi = np.array([surrogate.predict_v(
+        L_c,c_c,float(cfg['t_c']),float(cfg['xf']),float(cfg['xr']),
+        float(cfg['ts']),float(cfg['tw']),int(cfg['n_ribs']),
+        float(cfg['E']),p_c,yy) for yy in y_v])
+    
+    # Get training points
+    cfg_rows = df[
+        (df['L'] == cfg['L']) & (df['c'] == cfg['c']) &
+        (df['t_c'] == cfg['t_c']) & (df['xf'] == cfg['xf']) &
+        (df['xr'] == cfg['xr']) & (df['ts'] == cfg['ts']) &
+        (df['tw'] == cfg['tw']) & (df['n_ribs'] == cfg['n_ribs']) &
+        (df['E'] == cfg['E']) & (df['p'] == cfg['p'])
+    ]
+    
+    ax.plot(y_v, d_an, 'k-', lw=2, label='Analytical (truth)')
+    ax.plot(y_v, d_pi, 'b--', lw=2, label='SplitPINN prediction')
+    ax.scatter(cfg_rows['y'], cfg_rows['D'], c='red', s=100, zorder=5,
+               marker='o', edgecolors='black', label='Training data (3 points)')
+    
+    # Shade the regions between sparse points
+    y_limits = [0, L_c/2, L_c]
+    for i in range(len(y_limits)-1):
+        ax.axvspan(y_limits[i], y_limits[i+1], alpha=0.1, color='gray')
+    
+    ax.set_xlabel('Span y (mm)')
+    ax.set_ylabel('Deflection v (mm)')
+    ax.set_title('PINN Fills the Gaps Between Sparse Data Points\n'
+                 'Physics guides the shape between root, mid-span, and tip')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.25)
+    
+    plt.tight_layout()
+    plt.savefig(OUT_DIR + 'split_sparse_fig7_collocation_check.png')
+    plt.close()
+    print("  ✓ split_sparse_fig7_collocation_check.png")
+
+
+# =============================================================
+# 8. MAIN
+# =============================================================
+
+if __name__ == "__main__":
+
+    print("=" * 57)
+    print("  SPLIT PINN — SPARSE DATA VALIDATION (ConfigEncoder)")
+    print("  Training data: Wingdata2.csv (3 points per wing)")
+    print("=" * 57)
+
+    # Load data and surrogate
+    df        = pd.read_csv(CSV)
+    surrogate = SplitPINNSurrogate(MODEL_PATH)
+    
+    # Verify sparse data structure
+    unique_cfgs = df[CONFIG_COLS].drop_duplicates()
+    pts_per_cfg = len(df) // len(unique_cfgs)
+    print(f"\n  Data summary:")
+    print(f"    Total rows: {len(df)}")
+    print(f"    Unique wings: {len(unique_cfgs)}")
+    print(f"    Points per wing: {pts_per_cfg} (should be 3: root, mid, tip)")
+    
+    # Section A: Sparse data validation (training points only)
+    sparse_errors = sparse_data_validation(df, surrogate)
+
+    # Section B: full dataset validation
+    (records, r2, rmse, nrmse, mae, maxae,
+     errs, act_arr, pred_arr, frac_groups) = full_dataset_validation(
+         df, surrogate)
+
+    # Section C: extrapolation
+    fracs, extrap_errs, extrap_Ls = extrapolation_analysis(df, surrogate)
+
+    # Generate all figures
+    generate_figures(df, surrogate, records, r2, rmse, nrmse,
+                     act_arr, pred_arr, frac_groups,
+                     fracs, extrap_errs, extrap_Ls, sparse_errors)
+
+    # Final summary
+    print(f"\n{'='*57}")
+    print("  PAPER-READY METRICS SUMMARY (CONFIGENCODER)")
+    print(f"{'='*57}")
+    print(f"  Training data      : 3 points per wing (root, mid, tip)")
+    print(f"  R²                 : {r2:.4f}")
+    print(f"  RMSE               : {rmse:.4f} mm")
+    print(f"  NRMSE              : {nrmse:.4f}%")
+    print(f"  MAE                : {mae:.4f} mm")
+    print(f"  Max AE             : {maxae:.4f} mm")
+    print(f"  Mean rel error     : {errs.mean():.2f}%")
+    print(f"  Median rel error   : {np.median(errs):.2f}%")
+    print(f"  Rows within 5%     : {(errs<5).sum()/len(errs)*100:.1f}%")
+    print(f"\n  Root BC (explicit) : D=0 at y=0 (training data)")
+    print(f"    Root error       : {np.mean(sparse_errors['root']):.4f} mm")
+    print(f"\n  Physics fills gaps between 3 sparse points")
+    print(f"  See split_sparse_fig7_collocation_check.png")
+    print(f"{'='*57}")
+    print("\n✅ Sparse data validation complete — all figures saved.")
+
+
+## Inference for Interpolation cases 
+
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import sklearn.preprocessing._data
+
+# ================= SAFE LOAD =================
+torch.serialization.add_safe_globals([sklearn.preprocessing._data.StandardScaler])
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MODEL_PATH = "best_split_pinn_FINAL.pth"
+
+INPUT_COLS  = ['L','c','t_c','xf','xr','ts','tw','n_ribs','E','p','y']
+CONFIG_COLS = ['L','c','t_c','xf','xr','ts','tw','n_ribs','E','p']
+IDX_Y = 10
+
+
+# ================= MODEL =================
+class ConfigEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(10, 32), nn.Tanh(),
+            nn.Linear(32, 16), nn.Tanh(),
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, config):
+        return torch.exp(self.net(config) + 10.0)
+
+
+class SplitPINN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.freqs = torch.arange(1, 11).float()
+
+        self.net = nn.Sequential(
+            nn.Linear(11 + 20, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, 2)
+        )
+
+    def fourier(self, x):
+        y = x[:, IDX_Y:IDX_Y+1]
+        f = self.freqs.to(x.device)
+        return torch.cat([
+            torch.sin(2*np.pi*f*y/250.0),
+            torch.cos(2*np.pi*f*y/250.0)
+        ], dim=1)
+
+    def forward(self, x):
+        out = self.net(torch.cat([x, self.fourier(x)], dim=1))
+        return out[:,0:1], out[:,1:2]
+
+
+# ================= LOAD =================
+ckpt = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+
+model = SplitPINN().to(device)
+ei_encoder = ConfigEncoder().to(device)
+
+model.load_state_dict(ckpt['model'])
+ei_encoder.load_state_dict(ckpt['ei_encoder'])
+
+in_scaler  = ckpt['in_scaler']
+out_scaler = ckpt['out_scaler']
+
+model.eval()
+
+
+# ================= CASES =================
+cases = [
+
+{
+'config': {'L':1420,'c':220,'t_c':0.14,'xf':45,'xr':150,'ts':2.2,'tw':3.5,'n_ribs':5,'E':69000,'p':0.004},
+'fea_y': [0,142,355,710,1065,1420],
+'fea_d': [0,1.008,5.125,16.87,31.696,47.318]
+},
+
+{
+'config': {'L':972,'c':272,'t_c':0.13,'xf':40,'xr':188,'ts':3.8,'tw':4,'n_ribs':4,'E':68000,'p':0.005},
+'fea_y': [0,97.2,243,486,729,972],
+'fea_d': [0,0.18,0.716,2.237,4.121,6.093]
+},
+
+{
+'config': {'L':1520,'c':250,'t_c':0.13,'xf':50,'xr':190,'ts':2.6,'tw':3.9,'n_ribs':3,'E':70000,'p':0.007},
+'fea_y': [0,152,380,760,1140,1520],
+'fea_d': [0,1.889,9.047,29.712,55.687,83.092]
+},
+
+{
+'config': {'L':1260,'c':160,'t_c':0.15,'xf':43,'xr':120,'ts':3,'tw':3.2,'n_ribs':3,'E':71000,'p':0.009},
+'fea_y': [0,126,315,630,945,1260],
+'fea_d': [0,1.594,8.418,27.955,52.569,78.572]
+},
+
+{
+'config': {'L':1130,'c':182,'t_c':0.12,'xf':49,'xr':130,'ts':2.4,'tw':4,'n_ribs':2,'E':72000,'p':0.008},
+'fea_y': [0,113,282.5,565,847.5,1130],
+'fea_d': [0,1.375,7.15,23.662,44.459,66.414]
+}
+
+]
+
+
+# ================= FUNCTION =================
+def predict_span(config, n_points=200):
+    L = config['L']
+    y_vals = np.linspace(0, L, n_points)
+
+    inputs = []
+    for y in y_vals:
+        row = config.copy()
+        row['y'] = y
+        inputs.append([row[k] for k in INPUT_COLS])
+
+    X = np.array(inputs, dtype=np.float32)
+    X_scaled = in_scaler.transform(X)
+    X_t = torch.tensor(X_scaled, device=device)
+
+    with torch.no_grad():
+        v_pred, _ = model(X_t)
+
+    v_pred = v_pred.cpu().numpy().flatten()
+    v_pred = v_pred * out_scaler.scale_ + out_scaler.mean_
+
+    return y_vals, v_pred
+
+
+# ================= LOOP =================
+for i, case in enumerate(cases):
+
+    y_pred, v_pred = predict_span(case['config'])
+
+    # Interpolate predictions at FEA points
+    interp_pred = np.interp(case['fea_y'], y_pred, v_pred)
+
+    # RMSE
+    rmse = np.sqrt(np.mean((interp_pred - case['fea_d'])**2))
+
+    # Plot
+    plt.figure(figsize=(6,4))
+
+    plt.plot(y_pred, v_pred, linewidth=2, label='PINN')
+    plt.scatter(case['fea_y'], case['fea_d'], color='red', label='FEA')
+
+    plt.title(f'Case {i+1} | RMSE = {rmse:.3f} mm')
+    plt.xlabel("Span (y)")
+    plt.ylabel("Deflection (mm)")
+    plt.legend()
+    plt.grid()
+
+    plt.show()
 
