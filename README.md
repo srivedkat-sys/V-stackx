@@ -2,7 +2,7 @@
 
 This repository contains implementations of machine learning and physics-informed neural networks (PINNs) for structural analysis and engineering applications.
 
-## 🔍 Overview
+# Overview
 
 The project focuses on:
 
@@ -11,29 +11,29 @@ The project focuses on:
 * Structural response prediction (beam/wing deflection)
 * Sparse-data learning and surrogate modeling
 
-## 📂 Contents
+# Contents
 
 * `pinn/` — PINN implementations
 * `nn_baseline/` — Data-only models
 * `experiments/` — training and evaluation scripts
 * `utils/` — helper functions
 
-## ⚙️ Features
+# Features
 
 * Learnable stiffness modeling (EI)
 * Sparse measurement learning (3-point supervision)
 * Extrapolation analysis
 
 
-## 🚀 Future Work
+# Future Work
 
 * Operator learning (DeepONet / FNO)
 * Extended structural models
 
-## 📜 License
+# License
 
 This project is licensed under the MIT License.
 
-## 👤 Author
+# Author
 
 Ved
