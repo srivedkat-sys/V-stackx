@@ -1,1 +1,241 @@
-# PINN implementation for structural applications 
+## Also contains a small inference at the end for quick reference
+
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+CSV = "/home/ved/wing/Wingdata2.csv"
+SAVE_PATH = "best_split_pinn_FINAL.pth"
+
+INPUT_COLS  = ['L','c','t_c','xf','xr','ts','tw','n_ribs','E','p','y']
+CONFIG_COLS = ['L','c','t_c','xf','xr','ts','tw','n_ribs','E','p']
+TARGET_COL  = ['D']
+IDX_Y = 10
+
+
+# ================= MODEL =================
+class ConfigEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(10, 32), nn.Tanh(),
+            nn.Linear(32, 16), nn.Tanh(),
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, config):
+        return torch.exp(self.net(config) + 10.0)
+
+
+class SplitPINN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.freqs = torch.arange(1, 11).float()
+
+        self.net = nn.Sequential(
+            nn.Linear(11 + 20, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, 64), nn.Tanh(),
+            nn.Linear(64, 2)
+        )
+
+    def fourier(self, x):
+        y = x[:, IDX_Y:IDX_Y+1]
+        f = self.freqs.to(x.device)
+        return torch.cat([
+            torch.sin(2*np.pi*f*y/250.0),
+            torch.cos(2*np.pi*f*y/250.0)
+        ], dim=1)
+
+    def forward(self, x):
+        x = torch.cat([x, self.fourier(x)], dim=1)
+        out = self.net(x)
+        return out[:,0:1], out[:,1:2]
+
+
+# ================= SAFE ADAPTIVE =================
+class SafeAdaptive(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.log_vars = nn.Parameter(torch.zeros(2))  # phys, bc
+
+    def forward(self, phys_loss, bc_loss):
+        log_vars = torch.clamp(self.log_vars, -2, 2)
+        precision = torch.exp(-log_vars)
+
+        phys_term = 0.03 * precision[0] * phys_loss
+        bc_term   = 0.01 * precision[1] * bc_loss
+
+        return phys_term + bc_term
+
+
+# ================= PHYSICS =================
+def physics_loss(model, ei_encoder, X):
+    X = X.clone().detach().requires_grad_(True)
+    v, M = model(X)
+
+    dv = torch.autograd.grad(v, X, torch.ones_like(v), create_graph=True, retain_graph=True)[0]
+    d2v = torch.autograd.grad(dv[:, IDX_Y:IDX_Y+1], X, torch.ones_like(v), create_graph=True, retain_graph=True)[0]
+    d2v_y = d2v[:, IDX_Y:IDX_Y+1]
+
+    dM = torch.autograd.grad(M, X, torch.ones_like(M), create_graph=True, retain_graph=True)[0]
+    d2M = torch.autograd.grad(dM[:, IDX_Y:IDX_Y+1], X, torch.ones_like(M), create_graph=True)[0]
+    d2M_y = d2M[:, IDX_Y:IDX_Y+1]
+
+    config = X[:, :10]
+    EI = ei_encoder(config)
+
+    p = X[:, 9:10]
+    c = X[:, 1:2]
+    w = p * c
+
+    loss1 = torch.mean(((M - EI*d2v_y)/(EI.abs()+1e-6))**2)
+    loss2 = torch.mean(((d2M_y - w)/(w.abs()+1e-6))**2)
+
+    return loss1 + loss2
+
+
+def boundary_loss(model, X):
+    X = X.clone().detach().requires_grad_(True)
+    v, _ = model(X)
+
+    dv = torch.autograd.grad(v, X, torch.ones_like(v), create_graph=True)[0]
+    dv_dy = dv[:, IDX_Y:IDX_Y+1]
+
+    return torch.mean(v**2) + torch.mean(dv_dy**2)
+
+
+# ================= COLLOCATION =================
+def build_collocation(df, scaler, n=30):
+    unique = df[CONFIG_COLS].drop_duplicates().reset_index(drop=True)
+    rows = []
+
+    for _, row in unique.iterrows():
+        L = row['L']
+        y_root = (np.linspace(0,1,12)**2.5)*0.2*L
+        y_span = np.linspace(0.2*L, L, n-12)
+        y_all = np.concatenate([y_root, y_span])
+
+        for y in y_all:
+            r = row.copy()
+            r['y'] = y
+            rows.append(r)
+
+    coll_df = pd.DataFrame(rows)[INPUT_COLS]
+    return torch.tensor(scaler.transform(coll_df.values.astype(np.float32)), device=device)
+
+
+def build_root(df, scaler):
+    unique = df[CONFIG_COLS].drop_duplicates().reset_index(drop=True)
+    rows = []
+    for _, row in unique.iterrows():
+        r = row.copy()
+        r['y'] = 0.0
+        rows.append(r)
+
+    root_df = pd.DataFrame(rows)[INPUT_COLS]
+    return torch.tensor(scaler.transform(root_df.values.astype(np.float32)), device=device)
+
+
+# ================= TRAIN =================
+def train():
+    df = pd.read_csv(CSV)
+    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+
+    in_scaler = StandardScaler()
+    out_scaler = StandardScaler()
+
+    X_train = in_scaler.fit_transform(train_df[INPUT_COLS].values.astype(np.float32))
+    X_val   = in_scaler.transform(val_df[INPUT_COLS].values.astype(np.float32))
+    Y_train = out_scaler.fit_transform(train_df[TARGET_COL].values).flatten()
+
+    X_train = torch.tensor(X_train, device=device)
+    Y_train = torch.tensor(Y_train, device=device)
+    X_val   = torch.tensor(X_val, device=device)
+
+    X_coll = build_collocation(df, in_scaler)
+    X_root = build_root(df, in_scaler)
+
+    model = SplitPINN().to(device)
+    ei_encoder = ConfigEncoder().to(device)
+    adaptive = SafeAdaptive().to(device)
+
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) +
+        list(ei_encoder.parameters()) +
+        list(adaptive.parameters()),
+        lr=5e-4
+    )
+
+    best_rmse = float('inf')
+
+    for ep in range(12000):
+        optimizer.zero_grad()
+
+        v_pred, _ = model(X_train)
+        data_loss = torch.mean((v_pred.squeeze() - Y_train)**2)
+
+        phys = physics_loss(model, ei_encoder, X_coll)
+        bc   = boundary_loss(model, X_root)
+
+        # 🔥 HYBRID LOGIC
+        if ep < 500:
+            loss = data_loss
+        else:
+            phys_w = min(0.03, (ep-500)/1500.0)
+            loss = data_loss + phys_w * adaptive(phys, bc)
+
+        loss.backward()
+        optimizer.step()
+
+        if ep % 300 == 0:
+            with torch.no_grad():
+                vp, _ = model(X_val)
+                pred = vp.squeeze().cpu().numpy()*out_scaler.scale_ + out_scaler.mean_
+                true = val_df[TARGET_COL].values.flatten()
+
+                rmse = np.sqrt(np.mean((pred-true)**2))
+                r2 = 1 - np.sum((true-pred)**2)/(np.sum((true-true.mean())**2)+1e-12)
+
+            print(f"Ep {ep} | RMSE {rmse:.3f} | R2 {r2:.4f}")
+
+            if rmse < best_rmse:
+                best_rmse = rmse
+                torch.save({
+                    'model': model.state_dict(),
+                    'ei_encoder': ei_encoder.state_dict(),
+                    'in_scaler': in_scaler,
+                    'out_scaler': out_scaler
+                }, SAVE_PATH)
+
+    print(f"\nBest RMSE = {best_rmse:.3f}")
+
+    # ================= INFERENCE =================
+    print("\nRunning inference...\n")
+
+    input_dict = {
+        'L':1420,'c':220,'t_c':0.14,'xf':45,'xr':150,
+        'ts':2.2,'tw':3.5,'n_ribs':5,'E':69000,'p':0.004,'y':1420
+    }
+
+    x = np.array([[input_dict[k] for k in INPUT_COLS]], dtype=np.float32)
+    x_scaled = in_scaler.transform(x)
+    x_t = torch.tensor(x_scaled, device=device)
+
+    with torch.no_grad():
+        v_pred, _ = model(x_t)
+
+    v_pred = v_pred.cpu().numpy().flatten()
+    v_pred = v_pred * out_scaler.scale_ + out_scaler.mean_
+
+    print(f"Predicted Deflection = {v_pred[0]:.4f} mm")
+
+
+if __name__ == "__main__":
+    train()
