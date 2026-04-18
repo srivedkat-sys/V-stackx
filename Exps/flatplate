@@ -1095,3 +1095,165 @@ print(f"\nSaved full metrics to {csv_path}")
 
 
 
+## Heatmap generation script (The final block*)
+
+# =====================================================
+# FULL SCRIPT — TRAIN → VALIDATE → HEATMAPS 
+# =====================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.preprocessing import MinMaxScaler
+
+# =====================================================
+# SETUP
+# =====================================================
+project_dir = "/content"   # Change if files are elsewhere
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+coord_path = os.path.join(project_dir, "Coordinate2.csv")
+data_path  = os.path.join(project_dir, "Data3.csv")
+val_path   = os.path.join(project_dir, "validation2.csv")
+
+# =====================================================
+# LOAD COORDINATE MAPPING (S-index → X,Y)
+# =====================================================
+coords = pd.read_csv(coord_path)
+Xp = coords['X'].values   # length 441
+Yp = coords['Y'].values   # length 441
+
+# =====================================================
+# LOAD TRAINING STRESS FIELD
+# =====================================================
+data = pd.read_csv(data_path)
+y_stress = data.filter(regex='^S\d+').values   # shape (samples, 441)
+X = coords[['X','Y']].values                   # 441 points
+
+print("Training stress shape:", y_stress.shape)
+
+# =====================================================
+# SCALING
+# =====================================================
+stress_scaler = MinMaxScaler()
+y_stress_scaled = stress_scaler.fit_transform(y_stress)
+
+coord_scaler = MinMaxScaler()
+X_scaled = coord_scaler.fit_transform(X)
+
+X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+y_tensor = torch.tensor(y_stress_scaled, dtype=torch.float32).to(device)
+
+# =====================================================
+# MODEL
+# =====================================================
+class MLP(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(in_features, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, 4096),
+            nn.ReLU(),
+            nn.Linear(4096, out_features)   # 441 outputs
+        )
+    def forward(self, x):
+        return self.model(x)
+
+forward_model = MLP(in_features=2, out_features=y_stress.shape[1]).to(device)
+
+criterion = nn.MSELoss()
+optimizer = optim.Adam(forward_model.parameters(), lr=1e-3)
+
+# =====================================================
+# TRAINING
+# =====================================================
+epochs = 8000
+print("Training...")
+
+for epoch in range(epochs):
+    optimizer.zero_grad()
+    outputs = forward_model(X_tensor)
+    loss = criterion(outputs, y_tensor)
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 200 == 0 or epoch == epochs - 1:
+        print(f"Epoch {epoch} Loss = {loss.item():.6f}")
+
+# =====================================================
+# VALIDATION
+# =====================================================
+val_df = pd.read_csv(val_path)
+val_coords = val_df[['x', 'y']].values
+val_true_max = val_df['s'].values
+
+val_scaled = coord_scaler.transform(val_coords)
+val_tensor = torch.tensor(val_scaled, dtype=torch.float32).to(device)
+
+with torch.no_grad():
+    val_pred_scaled = forward_model(val_tensor).cpu().numpy()
+
+val_pred = stress_scaler.inverse_transform(val_pred_scaled)
+val_pred_max = val_pred.max(axis=1)
+
+print("\n=== VALIDATION RESULTS ===")
+for i in range(len(val_true_max)):
+    print(f"Point {i+1}: True={val_true_max[i]:.6f} | Pred={val_pred_max[i]:.6f} | Err={abs(val_true_max[i]-val_pred_max[i]):.6f}")
+
+# =====================================================
+# HEATMAP FOR UNSTRUCTURED GRID
+# =====================================================
+def generate_heatmap_unstructured(pred, x_val, y_val, idx):
+    grid_x, grid_y = np.mgrid[
+        Xp.min():Xp.max():200j,
+        Yp.min():Yp.max():200j
+    ]
+
+    Z_grid = griddata(
+        (Xp, Yp),
+        pred,
+        (grid_x, grid_y),
+        method='cubic'
+    )
+
+    plt.figure(figsize=(6,5))
+    im = plt.imshow(
+        Z_grid.T,
+        extent=[Xp.min(), Xp.max(), Yp.min(), Yp.max()],
+        origin='lower',
+        cmap='jet',
+        aspect='auto'
+    )
+    plt.scatter(x_val, y_val, color='red', s=40)
+    plt.colorbar(im)
+    plt.title(f"Heatmap #{idx} | Load at ({x_val:.3f}, {y_val:.3f})")
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.show()
+
+# =====================================================
+# LOOP OVER VALIDATION POINTS
+# =====================================================
+print("\nGenerating heatmaps...\n")
+
+for idx, (xv, yv) in enumerate(val_coords):
+    generate_heatmap_unstructured(val_pred[idx], xv, yv, idx+1)
